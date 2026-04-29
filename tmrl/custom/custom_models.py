@@ -66,6 +66,46 @@ def _squashed_gaussian_logprob(pi_distribution, pi_action):
     return logp_total, logp_per_dim
 
 
+def _apply_sagr(pre_tanh_action, delta=0.05):
+    """
+    SAGR: Squash-Aware Gradient Rescaling (Novel — part of GRAC algorithm).
+
+    Registers a backward hook on the pre-tanh action tensor that rescales
+    gradients to prevent vanishing through tanh saturation.
+
+    When |action| approaches 1, the tanh derivative (1 - a^2) approaches 0,
+    killing the policy gradient. SAGR ensures the effective Jacobian never
+    drops below `delta`, preserving gradient flow at action boundaries.
+
+    Math:
+        Standard gradient:  dL/du = dL/da * (1 - a^2)
+        SAGR gradient:      dL/du = dL/da * max(1 - a^2, delta)
+
+    Implementation:
+        The hook receives grad_u (which already has (1-a^2) baked in from
+        autograd). We undo the vanished Jacobian and replace with the floored
+        version: grad_corrected = grad_u * max(1-a^2, delta) / (1-a^2 + eps)
+
+    Args:
+        pre_tanh_action: u (before tanh), must have requires_grad=True
+        delta: minimum gradient floor (default 0.05 = 5% of max gradient)
+    """
+    if not pre_tanh_action.requires_grad:
+        return
+
+    # Compute squashed action for correction factor (detached from graph)
+    a_detached = torch.tanh(pre_tanh_action).detach()
+
+    def hook(grad):
+        a_sq = a_detached ** 2
+        tanh_jac = 1.0 - a_sq                # Standard Jacobian: (1 - a^2)
+        safe_jac = tanh_jac.clamp(min=delta)  # Floored Jacobian: max(1-a^2, delta)
+        correction = safe_jac / (tanh_jac + 1e-8)
+        return grad * correction
+
+    pre_tanh_action.register_hook(hook)
+
+
 class SquashedGaussianMLPActor(TorchActorModule):
     def __init__(self, observation_space, action_space, hidden_sizes=(256, 256), activation=nn.ReLU):
         super().__init__(observation_space, action_space)
@@ -1037,6 +1077,7 @@ class SharedBackboneHybridActorCritic(nn.Module):
         else:
             logp_total, logp_per_dim = None, None
 
+        _apply_sagr(pi_action)  # GRAC: rescue vanishing gradients through tanh
         pi_action = torch.tanh(pi_action)
         pi_action = self.actor.act_limit * pi_action
         return pi_action, logp_total, logp_per_dim
@@ -1150,6 +1191,7 @@ class DroQHybridActorCritic(nn.Module):
         else:
             logp_total, logp_per_dim = None, None
 
+        _apply_sagr(pi_action)  # GRAC: rescue vanishing gradients through tanh
         pi_action = torch.tanh(pi_action)
         pi_action = self.actor.act_limit * pi_action
         return pi_action, logp_total, logp_per_dim
@@ -1562,7 +1604,7 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         # Smart init: car drives forward from step 1 (steer=0, gas=0.3, brake=0)
         with torch.no_grad():
             nn.init.zeros_(self.mu_layer.weight)
-            self.mu_layer.bias.copy_(torch.tensor([0.0, 1.5, 0.0]))
+            self.mu_layer.bias.copy_(torch.tensor([0.0, 2.0, -2.0]))
         
         self.std_net = nn.Sequential(
             nn.Linear(FUSED_DIM + CONTEXT_Z_DIM, 64),
@@ -1756,7 +1798,7 @@ class ContextualDroQHybridActorCritic(nn.Module):
         # film_params = self.film_generator(z)
         return fused, critic_features, None, z # Modified: film_params is now None
 
-    def actor_from_features(self, fused, film_params=None, test=False, with_logprob=True, z=None):
+    def actor_from_features(self, fused, film_params=None, test=False, with_logprob=True, z=None, return_pretanh_mu=False):
         """Compute action from fused features + context z (PEARL)."""
         del film_params
         fused = fused.detach()
@@ -1780,8 +1822,12 @@ class ContextualDroQHybridActorCritic(nn.Module):
         else:
             logp_total, logp_per_dim = None, None
 
+        _apply_sagr(pi_action)  # GRAC: rescue vanishing gradients through tanh
         pi_action = torch.tanh(pi_action)
         pi_action = self.actor.act_limit * pi_action
+        
+        if return_pretanh_mu:
+            return pi_action, logp_total, logp_per_dim, mu
         return pi_action, logp_total, logp_per_dim
 
     def q_from_features(self, critic_floats, act, film_params, q_idx=None):
@@ -2337,7 +2383,16 @@ class LatentWorldModel(nn.Module):
         loss_recon = recon_state + recon_reward
 
         # KL divergence: KL(posterior || prior), with free nats
-        kl = self._kl_divergence(mu_post, log_var_post, mu_prior, log_var_prior)
+        var_post = log_var_post.exp()
+        var_prior = log_var_prior.exp()
+        kl_per_dim = 0.5 * (
+            log_var_prior - log_var_post
+            + var_post / var_prior
+            + (mu_post - mu_prior).pow(2) / var_prior
+            - 1.0
+        )
+        kl_per_sample = kl_per_dim.sum(dim=-1)
+        kl = kl_per_sample.mean()
         kl_clamped = torch.clamp(kl, min=self.kl_free_nats)
 
         loss = loss_recon + kl_clamped
@@ -2349,6 +2404,38 @@ class LatentWorldModel(nn.Module):
             "wm_kl_clamped": kl_clamped.item(),
             "wm_total_loss": loss.item(),
         }
+
+        with torch.no_grad():
+            z_dim_std = z_t.detach().std(dim=0, unbiased=False)
+            reward_error = reward_hats.detach() - reward_target.detach()
+            metrics.update({
+                "wm/z_t_mean": z_t.detach().mean().item(),
+                "wm/z_t_std": z_t.detach().std(unbiased=False).item(),
+                "wm/z_t_abs_mean": z_t.detach().abs().mean().item(),
+                "wm/z_t_dead_dim_ratio_1e3": (z_dim_std < 1e-3).float().mean().item(),
+                "wm/z_t_dim_std_min": z_dim_std.min().item(),
+                "wm/z_t_dim_std_mean": z_dim_std.mean().item(),
+                "wm/z_t_dim_std_max": z_dim_std.max().item(),
+                "wm/prior_mu_mean": mu_prior.detach().mean().item(),
+                "wm/prior_mu_std": mu_prior.detach().std(unbiased=False).item(),
+                "wm/prior_logvar_mean": log_var_prior.detach().mean().item(),
+                "wm/prior_logvar_std": log_var_prior.detach().std(unbiased=False).item(),
+                "wm/post_mu_mean": mu_post.detach().mean().item(),
+                "wm/post_mu_std": mu_post.detach().std(unbiased=False).item(),
+                "wm/post_logvar_mean": log_var_post.detach().mean().item(),
+                "wm/post_logvar_std": log_var_post.detach().std(unbiased=False).item(),
+                "wm/kl_mean": kl_per_sample.detach().mean().item(),
+                "wm/kl_std": kl_per_sample.detach().std(unbiased=False).item(),
+                "wm/kl_min": kl_per_sample.detach().min().item(),
+                "wm/kl_max": kl_per_sample.detach().max().item(),
+                "wm/state_recon_loss": recon_state.detach().item(),
+                "wm/reward_loss": recon_reward.detach().item(),
+                "wm/reward_pred_mean": reward_hats.detach().mean().item(),
+                "wm/reward_pred_std": reward_hats.detach().std(unbiased=False).item(),
+                "wm/reward_target_mean": reward_target.detach().mean().item(),
+                "wm/reward_target_std": reward_target.detach().std(unbiased=False).item(),
+                "wm/reward_error_abs_mean": reward_error.abs().mean().item(),
+            })
         return loss, metrics
 
     @staticmethod

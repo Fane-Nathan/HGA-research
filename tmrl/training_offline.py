@@ -1,6 +1,7 @@
 # standard library imports
 import csv
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -100,6 +101,111 @@ def compute_stall_dashboard(stall_state, warning_epochs=5):
         "status": status,
         "warning_epochs": int(warning_epochs),
     }
+
+
+def _format_metric_value(value):
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if math.isnan(val) or math.isinf(val):
+        return str(val)
+    if abs(val) >= 10000.0 or (0.0 < abs(val) < 0.0001):
+        return f"{val:.4e}"
+    return f"{val:.6f}".rstrip("0").rstrip(".")
+
+
+def _metric_matches(key, exact=(), prefixes=()):
+    return key in exact or any(key.startswith(prefix) for prefix in prefixes)
+
+
+def _format_sectioned_stats(stats_series):
+    sections = [
+        (
+            "RUN / RETURNS / TIMING",
+            {
+                "exact": ("memory_len", "round_time", "idle_time", "update_buf_time", "train_time"),
+                "prefixes": ("return_", "episode_length_", "sampling_duration", "training_step_duration"),
+            },
+        ),
+        (
+            "ACTOR / ENTROPY",
+            {
+                "exact": ("loss_actor", "loss_entropy_coef", "entropy_coef", "loss_awdb", "loss_sbr"),
+                "prefixes": ("debug_alpha_", "debug_log_std_", "grad_norm_actor", "grad_health_", "ghae_boost_"),
+            },
+        ),
+        (
+            "CRITIC",
+            {
+                "exact": ("loss_critic", "grad_norm_critic", "kl_div_loss", "ewc_loss"),
+                "prefixes": (),
+            },
+        ),
+        (
+            "TRUST / UNCERTAINTY",
+            {
+                "exact": (),
+                "prefixes": ("verifier_", "wm/verifier_", "bridge/trust"),
+            },
+        ),
+        (
+            "IMAGINATION",
+            {
+                "exact": ("imag_actor_loss", "wm_imagined_steps", "wm_imagined_q_loss"),
+                "prefixes": ("wm_imag/",),
+            },
+        ),
+        (
+            "WORLD MODEL",
+            {
+                "exact": ("dynamics_loss", "wm_train_steps", "wm_kl", "wm_recon_state"),
+                "prefixes": ("wm/", "wm_input/", "wm_grad/", "curiosity_"),
+            },
+        ),
+        (
+            "BRIDGE",
+            {
+                "exact": (),
+                "prefixes": ("bridge/",),
+            },
+        ),
+        (
+            "STABILITY GUARDS",
+            {
+                "exact": (),
+                "prefixes": ("guard/",),
+            },
+        ),
+    ]
+
+    items = [(str(key), value) for key, value in stats_series.items()]
+    used = set()
+    output = []
+
+    for title, matcher in sections:
+        rows = []
+        for key, value in items:
+            if key in used:
+                continue
+            if _metric_matches(key, exact=matcher["exact"], prefixes=matcher["prefixes"]):
+                rows.append((key, value))
+                used.add(key)
+        if rows:
+            output.append(f"========== {title} ==========")
+            width = min(max(len(key) for key, _ in rows), 64)
+            for key, value in rows:
+                output.append(f"  {key:<{width}} : {_format_metric_value(value)}")
+
+    other_rows = [(key, value) for key, value in items if key not in used]
+    if other_rows:
+        output.append("========== OTHER ==========")
+        width = min(max(len(key) for key, _ in other_rows), 64)
+        for key, value in other_rows:
+            output.append(f"  {key:<{width}} : {_format_metric_value(value)}")
+
+    return "\n".join(output) + "\n"
 
 
 @dataclass(eq=0)
@@ -238,8 +344,7 @@ class TrainingOffline:
         # Escalate recovery strength when fully stalled.
         hard_stall = stall_epochs >= patience
         utd_step = 2 if hard_stall else 1
-        alpha_step = 0.02 if hard_stall else 0.01
-        alpha_cap = 0.12 if hard_stall else 0.08
+        entropy_step = 0.5 if hard_stall else 0.2
 
         # 1) Reduce UTD pressure.
         if hasattr(self.agent, "q_updates_per_policy_update"):
@@ -249,13 +354,12 @@ class TrainingOffline:
                 self.agent.q_updates_per_policy_update = new_utd
                 action_parts.append(f"utd:{old_utd}->{new_utd}")
 
-        # 2) Raise entropy floor slightly to recover exploration.
-        if hasattr(self.agent, "alpha_floor"):
-            old_floor = float(self.agent.alpha_floor)
-            new_floor = min(alpha_cap, old_floor + alpha_step)
-            if abs(new_floor - old_floor) > 1e-12:
-                self.agent.alpha_floor = new_floor
-                action_parts.append(f"alpha_floor:{old_floor:.3f}->{new_floor:.3f}")
+        # 2) Boost Target Entropy organically instead of forcing an unnatural alpha_floor
+        old_bump = getattr(self.agent, "stall_entropy_bump", 0.0)
+        new_bump = min(2.0, old_bump + entropy_step)
+        if hasattr(self, "agent"):
+            self.agent.stall_entropy_bump = new_bump
+            action_parts.append(f"entropy_bump:+{entropy_step:.1f}")
 
         mode = "stalled" if hard_stall else "warning"
         action = ",".join(action_parts) if action_parts else f"hold({mode},no_change)"
@@ -359,6 +463,62 @@ class TrainingOffline:
             f"train_ma10={state['train_return_ma10']:.6f}, "
             f"stall_epochs={state['stall_epochs']}/{state['patience']}"
         )
+
+    def _apply_success_annealing(self, epoch_stats):
+        """Smoothly anneal Target Entropy based on continuous performance mapping."""
+        if not epoch_stats or not hasattr(self.agent, "target_entropy"):
+            return
+        
+        # Allow disabling the auto-annealer so GHAE manages entropy exclusively
+        alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
+        if not alg_cfg.get("AUTO_ANNEAL_ENABLED", True):
+            return
+            
+        train_epoch_return = float(sum(float(s.get("return_train", 0.0)) for s in epoch_stats) / len(epoch_stats))
+        
+        # Read bounds from config.json so the user can tune without code changes.
+        # Floor = TARGET_ENTROPY (high exploration), ceiling = floor - 3.0 (low entropy, exploitation)
+        alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
+        entropy_floor = float(alg_cfg.get("TARGET_ENTROPY", -0.9))  # exploration: loose entropy
+        entropy_ceiling = float(alg_cfg.get("TARGET_ENTROPY_CEILING", entropy_floor - 3.0))  # exploitation: tight entropy
+        anneal_score = float(alg_cfg.get("ANNEAL_SCORE_THRESHOLD", 65.0))  # return at which max exploitation is reached
+        
+        # Smoothly map train return (0 to anneal_score) to Target Entropy (floor to ceiling)
+        normalized_progress = max(0.0, min(1.0, train_epoch_return / anneal_score))
+        computed_target = entropy_floor + (normalized_progress * (entropy_ceiling - entropy_floor))
+        
+        # Apply anti-stall organic exploration bump
+        stall_bump = getattr(self.agent, "stall_entropy_bump", 0.0)
+        if stall_bump > 0.0:
+            computed_target = min(entropy_floor + 0.5, computed_target + stall_bump)
+            # Decay the bump naturally every epoch so it gradually returns to pure performance-based mapping
+            self.agent.stall_entropy_bump = max(0.0, stall_bump - 0.1)
+            
+        current_tensor = self.agent.target_entropy
+        dim_act = current_tensor.shape[0] if len(current_tensor.shape) > 0 else 3
+        current_val = float(current_tensor.mean().item()) * dim_act  # total entropy across dims
+            
+        # We limit the maximum change per epoch to prevent extreme shocks if score jumps
+        max_step = 0.05
+        
+        # Move current_val smoothly toward computed_target
+        if current_val > computed_target:
+            next_val = max(computed_target, current_val - max_step)
+        elif current_val < computed_target:
+            next_val = min(computed_target, current_val + max_step)
+        else:
+            next_val = current_val
+            
+        if abs(next_val - current_val) > 0.01:
+            per_dim = next_val / dim_act
+            self.agent.target_entropy = torch.full((dim_act,), per_dim, device=self.agent.device)
+            logging.info(f" Auto-Anneal: Score [{train_epoch_return:.2f}] -> Smoothly shifted Target Entropy from {current_val:.2f} to {next_val:.3f} (floor={entropy_floor}, ceiling={entropy_ceiling})")
+            
+            # Smoothly tighten deterministic regularization based on the same progress
+            # Map lambda from 0.01 (high exploration) to 0.05 (high exploitation)
+            if hasattr(self.agent, "det_reg_lambda"):
+                target_lambda = 0.01 + (normalized_progress * 0.04)
+                self.agent.det_reg_lambda = target_lambda
 
     def __getstate__(self):
         """Exclude unpicklable CSV file handle from checkpoint."""
@@ -471,7 +631,7 @@ class TrainingOffline:
             logging.debug(f"round_time:{round_time}, idle_time:{idle_time}, update_buf_time:{update_buf_time}, train_time:{train_time}")
             stats += pandas_dict(memory_len=len(self.memory), round_time=round_time, idle_time=idle_time, **DataFrame(stats_training).mean(skipna=True)),
 
-            logging.info(stats[-1].add_prefix("  ").to_string() + '\n')
+            logging.info("\n" + _format_sectioned_stats(stats[-1]))
 
             # === CSV: append round metrics ===
             if getattr(self, '_csv_writer', None) is not None:
@@ -491,6 +651,7 @@ class TrainingOffline:
 
         # Epoch-level anti-stall diagnostics.
         self._update_stall_diagnostics(stats)
+        self._apply_success_annealing(stats)
         self.epoch += 1
         return stats
 

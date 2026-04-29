@@ -1,182 +1,284 @@
-STATUS: APPROVED
+STATUS: REVIEW
 
-# 🛠️ TMRL Architecture & Stability Remediation Plan
+# TMRL WM + Bridge Gradient-Pass Logging Plan
 
-**Objective:** Prevent late-stage policy collapse, stabilize Q-value targets, and fix the deterministic policy (`return_test_det`) in the TrackMania DroQ/SAC custom architecture.
+## Objective
+Add lightweight diagnostics for each training gradient pass so we can see whether the world model, context bridge, imagined rollout bridge, critic bridge, and actor-gradient bridge are healthy.
 
-## Phase 1: Mathematical & Normalization Fixes
+The goal is observability only. Do not change the core Meta-RL agent structure, training loops, model architecture, optimizer behavior, or loss definitions unless a checklist item explicitly says so.
 
-_File to edit: `tmrl/custom/custom_models.py`_
+## Phase 1: Shared Logging Helpers
 
-### [x] 1. Fix the `LOG_STD_MIN` Bottleneck
+_Primary file: `tmrl/custom/custom_algorithms.py`_
 
-**Why:** A minimum log standard deviation of `-2` forces the car to inject a minimum of ~13.5% random noise into its steering, making it impossible to drive straight at high speeds.
+### [x] 1. Add tensor-stat and gradient-norm helpers
 
-- **Find:** `LOG_STD_MIN = -2` (around line 34)
-- **Change to:**
-
-```python
-LOG_STD_MIN = -20.0
-```
-
-### [x] 2. Remove `BatchNorm2d` from the CNN
-
-**Why:** Batch Normalization tracks a running mean/variance. In off-policy RL, the replay buffer distribution constantly shifts, causing the running stats to corrupt the network during `eval()` mode (which is why your deterministic policy scored `-0.405`).
-
-- **Find:** `conv_3x3_bn`, `conv_1x1_bn`, and `MBConv` functions/classes.
-- **Change:** Replace every instance of `nn.BatchNorm2d(...)` with `nn.GroupNorm(num_groups=1, num_channels=...)`.
+Add small local helpers near the existing algorithm utilities:
 
 ```python
-# Example fix for conv_3x3_bn:
-def conv_3x3_bn(inp, oup, stride):
-    return nn.Sequential(
-        nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
-        nn.GroupNorm(num_groups=1, num_channels=oup), # <--- Replaced BatchNorm2d
-        SiLU()
-    )
+def _add_tensor_stats(logs, prefix, x, dead_threshold=1e-3):
+    ...
+
+def _module_grad_norm(module):
+    ...
+
+def _parameter_grad_norm(parameters):
+    ...
 ```
 
-_(Make sure to do this for `conv_1x1_bn` and the `MBConv` class as well)._
+Requirements:
 
-### [x] 3. Disable Dropout in the Context Encoder
+- Helpers must be safe under `torch.no_grad()`.
+- They must tolerate `None` tensors/modules.
+- Tensor stats should include mean, std, abs mean, min, max.
+- For tensors with batch dimension and feature dimension, also log per-dimension std min/mean/max and dead-dimension ratio.
+- Gradient helpers should return `0.0` if no gradients exist.
 
-**Why:** DroQ relies on dropout _only_ in the Q-heads to estimate uncertainty. Having dropout in the Transformer creates noisy, moving targets for the Bellman equation, preventing the Critic from converging.
+## Phase 2: World Model Training Diagnostics
 
-- **Find:** `ContextEncoder.__init__`
-- **Change:** Set `dropout=0.0` in both Transformer layers (`state_layer` and `action_layer`).
+_Primary file: `tmrl/custom/custom_algorithms.py`_
 
-```python
-state_layer = nn.TransformerEncoderLayer(
-    d_model=enriched_dim, nhead=4, dim_feedforward=128,
-    dropout=0.0, batch_first=True, norm_first=True  # <--- Changed from 0.1 to 0.0
-)
+### [x] 2. Log replay inputs before each WM gradient pass
+
+Inside the dynamics/world-model training path, before the WM train step, log:
+
+```text
+wm_input/state_mean
+wm_input/state_std
+wm_input/state_abs_mean
+wm_input/next_state_mean
+wm_input/next_state_std
+wm_input/action_mean
+wm_input/action_std
+wm_input/reward_mean
+wm_input/reward_std
+wm_input/context_z_mean
+wm_input/context_z_std
+wm_input/context_z_dead_dim_ratio_1e3
 ```
 
----
+Requirements:
 
-## Phase 2: Fixing Gradient Interference (The Shared Backbone)
+- Use the shared tensor-stat helper.
+- Only log `context_z` stats when `context_z` is present.
+- Do not detach tensors in a way that changes training behavior.
 
-_File to edit: `tmrl/custom/custom_models.py`_
+### [x] 3. Log latent posterior, prior, KL, reconstruction, and reward metrics
 
-**Why:** Because the Actor and Critic share the CNN and Context Encoder, calling `.backward()` on the Actor destroys the representation learned by the Critic. We must block the Actor's gradients from flowing into the shared features.
+Inside `LatentWorldModel.train_step(...)`, extend the returned metrics with:
 
-### [x] 4. Detach features in `SharedBackboneHybridActorCritic`
-
-- **Find:** `def actor_from_features(self, features, film=None, test=False, with_logprob=True):`
-- **Change:** Add `.detach()` to the features.
-
-```python
-def actor_from_features(self, features, film=None, test=False, with_logprob=True):
-    del film
-    features = features.detach() # <--- ADD THIS LINE
-    net_out = self.actor.net(features)
-    # ... rest of function remains the same
+```text
+wm/z_t_mean
+wm/z_t_std
+wm/z_t_abs_mean
+wm/z_t_dead_dim_ratio_1e3
+wm/z_t_dim_std_min
+wm/z_t_dim_std_mean
+wm/z_t_dim_std_max
+wm/prior_mu_mean
+wm/prior_mu_std
+wm/prior_logvar_mean
+wm/prior_logvar_std
+wm/post_mu_mean
+wm/post_mu_std
+wm/post_logvar_mean
+wm/post_logvar_std
+wm/kl_mean
+wm/kl_std
+wm/kl_min
+wm/kl_max
+wm/state_recon_loss
+wm/reward_loss
+wm/reward_pred_mean
+wm/reward_pred_std
+wm/reward_target_mean
+wm/reward_target_std
+wm/reward_error_abs_mean
 ```
 
-### [x] 5. Detach features & FiLM params in `ContextualDroQHybridActorCritic`
+Requirements:
 
-- **Find:** `def actor_from_features(self, fused, film_params, test=False, with_logprob=True):`
-- **Change:** Add `.detach()` to both inputs.
+- Prefer existing loss tensors/variables where available.
+- Do not add extra forward passes for this checklist item.
+- Keep metric names stable and scalar.
 
-```python
-def actor_from_features(self, fused, film_params, test=False, with_logprob=True):
-    fused = fused.detach() # <--- ADD THIS LINE
+### [x] 4. Log WM gradient norms after backward and before optimizer step
 
-    if film_params is not None:
-        # <--- ADD THIS BLOCK --->
-        # Detach the tuples of (gamma, beta) to protect the FiLM generator
-        film_params = [(g.detach(), b.detach()) for g, b in film_params]
+In the WM training step, after `loss.backward()` and before optimizer stepping/clipping, log:
 
-    net_out = self.actor.net(fused, film_params)
-    # ... rest of function remains the same
+```text
+wm_grad/encoder
+wm_grad/prior
+wm_grad/posterior
+wm_grad/decoder
+wm_grad/reward_head
+wm_grad/total
 ```
 
----
+Requirements:
 
-## Phase 3: Fixing the Hyperparameter Search Space
+- Match names to actual submodules in `LatentWorldModel`.
+- If a submodule does not exist under that exact role, skip it or map it to the closest actual module name.
+- Do not change clipping or optimizer behavior.
 
-_File to edit: `hyperparameter_sweep_optuna.py`_
+## Phase 3: Imagination Rollout Diagnostics
 
-**Why:** Optuna is currently allowed to select combinations that are mathematically guaranteed to fail in non-stationary, high-UTD reinforcement learning. You must restrict the search space.
+_Primary file: `tmrl/custom/custom_algorithms.py`_
 
-### [x] 6. Restrict `GAMMA` (Discount Factor)
+### [x] 5. Log imagined rollout health by horizon
 
-**Why:** TrackMania requires looking far ahead. A gamma of `0.95` only looks ~20 steps ahead.
+Inside `LatentWorldModel.imagine(...)` or the caller that receives imagined rollout tensors, log per horizon:
 
-- **Fix:** Change your Optuna `suggest_` limits for gamma to force far-sightedness:
-
-```python
-gamma = trial.suggest_categorical("gamma", [0.99, 0.995, 0.999])
+```text
+wm_imag/h{h}_state_mean
+wm_imag/h{h}_state_std
+wm_imag/h{h}_state_abs_mean
+wm_imag/h{h}_action_mean
+wm_imag/h{h}_action_std
+wm_imag/h{h}_reward_mean
+wm_imag/h{h}_reward_std
+wm_imag/h{h}_uncertainty_mean
+wm_imag/h{h}_uncertainty_std
 ```
 
-### [x] 7. Restrict Adam `beta2`
+Requirements:
 
-**Why:** A `beta2` of `0.999` retains too much gradient history, causing explosive update steps when the car hits a new part of the track.
+- Log only tensors already produced by imagination.
+- If uncertainty is unavailable, skip uncertainty keys.
+- Keep the logging cheap enough to run every gradient pass.
 
-- **Fix:** Change your Optuna space for both betas to avoid 0.999:
+## Phase 4: Bridge Diagnostics
 
-```python
-beta2_critic = trial.suggest_categorical("beta2_critic", [0.99, 0.995])
-beta2_actor = trial.suggest_categorical("beta2_actor", [0.99, 0.995])
+_Primary file: `tmrl/custom/custom_algorithms.py`_
+
+### [x] 6. Log real-vs-imagined state and action bridge statistics
+
+In `_imagined_critic_update(...)`, log:
+
+```text
+bridge/state_real_mean
+bridge/state_real_std
+bridge/state_imag_mean
+bridge/state_imag_std
+bridge/state_distribution_gap
+bridge/action_real_mean
+bridge/action_real_std
+bridge/action_imag_mean
+bridge/action_imag_std
+bridge/act1_real_mean
+bridge/act2_real_mean
+bridge/act1_vs_imag_action_abs_diff
+bridge/act2_vs_act1_abs_diff
 ```
 
-### [x] 8. Cap the UTD (Update-To-Data) Ratio
+Requirements:
 
-**Why:** Updating the network 20 times per environment step (`20.0`) on a shared backbone will cause severe overfitting to the most recent batch.
+- `state_distribution_gap` should compare feature means between real and imagined states when shapes are compatible.
+- Action-history diagnostics should verify that critic history slots are not accidentally duplicated current actions.
+- Do not change imagined critic target construction.
 
-- **Fix:** Lower the maximum training steps per environment step to a safer range (e.g., 2 to 8).
+### [x] 7. Log context bridge health
 
-**Why:** Updating the network 20 times per environment step (`20.0`) on a shared backbone will cause severe overfitting to the most recent batch.
+Where `context_z` enters WM training, imagination, surprise, and critic-facing logic, log:
 
-- **Fix:** Lower the maximum training steps per environment step to a safer range (e.g., 2 to 8).
-
-```python
-max_training_steps_per_env_step = trial.suggest_int("max_training_steps_per_env_step", 2, 8)
+```text
+bridge/context_z_mean
+bridge/context_z_std
+bridge/context_z_abs_mean
+bridge/context_z_dead_dim_ratio_1e3
+bridge/context_z_requires_grad
+bridge/context_z_to_wm_present
+bridge/context_z_to_critic_present
 ```
 
----
+Requirements:
 
-## Phase 4: Restart Protocol
+- Presence flags should be `1.0` or `0.0`.
+- `requires_grad` should be logged as `1.0` or `0.0`.
+- Do not force gradients on or off.
 
-**CRITICAL DIAGNOSIS (Epoch 4 Explosion):**
-The "Explosion" (Actor Loss ~300, Q-Values ~-300) confirms that your **Replay Buffer is poisoned** with data from the old, unstable architecture. The Q-function has converged to a pessimistic "crash" value (-300) because the buffer is dominated by old failures. The stochastic policy gets lucky (+10 return) via noise, but the deterministic policy (-0.4 return) follows the pessimistic Q-function into a wall.
+### [x] 8. Log critic value bridge metrics for real vs imagined batches
 
-**You MUST clear the old data.**
+In critic update paths that have access to both real and imagined data, log:
 
-- [ ] **STOP TRAINING IMMEDIATELY**: This run is unrecoverable.
-- [ ] **Wipe Optuna Database**: Delete `TmrlData/hyperparameter_results/study_database.db`.
-- [ ] **Clear Replay Buffers**: Delete all `.pkl` files in `TmrlData/dataset/` and `TmrlData/reward/`.
-- [ ] **Clear Checkpoints**: Delete all files in `TmrlData/checkpoints/` and `TmrlData/weights/`.
-- [ ] **Restart Training**: Launch `python hyperparameter_sweep_optuna.py ...` fresh.
+```text
+bridge/q_real_mean
+bridge/q_real_std
+bridge/q_imag_mean
+bridge/q_imag_std
+bridge/q_imag_minus_real
+bridge/target_q_imag_mean
+bridge/target_q_imag_std
+bridge/imag_td_error_mean
+bridge/imag_td_error_abs_mean
+```
 
-With these fixes, your deterministic policy will actually start driving, your actor loss will remain flat/stable, and the agent will be able to sustain training for 50+ epochs without catastrophic collapse!
+Requirements:
 
----
+- Use existing Q predictions and targets when available.
+- Avoid adding expensive duplicate critic forward passes unless there is no existing value to log.
+- If real Q is not available in the imagined update function, log imagined-only values there and leave real-vs-imag comparison for the real critic update path.
 
-## Phase 6: The Gradient Deadzone and Loss Function Throttling
+### [x] 9. Log actor-critic gradient bridge health
 
-**Diagnosis recap:** Late-stage collapse (short episodes + rising critic loss) was consistent with two coupled issues:
+In the actor update path, add a cheap probe for:
 
-- A hard clamp on `logp_per_dim` in `_squashed_gaussian_logprob` created boundary deadzones (zero gradient at clamp limits), weakening actor/entropy adaptation.
-- `SmoothL1Loss` in `DroQSACAgent` reduced correction strength for large TD errors when critic targets needed fast re-scaling.
+```text
+bridge/dqda_norm
+bridge/dqda_abs_mean
+bridge/actor_action_requires_grad
+bridge/critic_input_requires_grad
+```
 
-### [x] 1. Remove Entropy Gradient Deadzone
+Requirements:
 
-_File edited: `tmrl/custom/custom_models.py`_
+- The probe must not alter the actual actor loss or optimizer state.
+- Use `torch.autograd.grad` carefully and tolerate unavailable gradients.
+- Do not retain graphs longer than needed.
 
-- Removed `torch.clamp(logp_per_dim, min=-5.0, max=5.0)` from `_squashed_gaussian_logprob`.
-- Restored unconstrained squashed-Gaussian log-prob correction so gradients can flow through large-action regimes.
+## Phase 5: Trust / Uncertainty Diagnostics
 
-### [x] 2. Restore Full Critic Error Correction
+_Primary file: `tmrl/custom/custom_algorithms.py`_
 
-_File edited: `tmrl/custom/custom_algorithms.py`_
+### [x] 10. Log verifier uncertainty and trust saturation
 
-- In `DroQSACAgent.__init__`, changed:
-  - `self.criterion = torch.nn.SmoothL1Loss(beta=1.0)`
-  - to `self.criterion = torch.nn.MSELoss()`
-- This returns standard SAC/REDQ-style critic pressure for large Bellman residuals.
+Where verifier uncertainty or trust is computed, log:
 
-### [x] 3. Fresh Timeline for Validation
+```text
+wm/verifier_uncertainty_mean
+wm/verifier_uncertainty_std
+wm/verifier_trust_mean
+wm/verifier_trust_std
+wm/verifier_trust_min
+wm/verifier_trust_max
+wm/verifier_trust_saturation_low
+wm/verifier_trust_saturation_high
+bridge/trust_mean
+bridge/trust_saturation_low
+bridge/trust_saturation_high
+```
 
-- Updated `C:\\Users\\felix\\TmrlData\\config\\config.json` run name to `Test_Stagnation_run_4`.
-- Next run should be launched from a clean start to evaluate Phase 6 changes in isolation.
+Requirements:
+
+- Saturation low is the fraction of trust values below `0.05`.
+- Saturation high is the fraction of trust values above `0.95`.
+- Do not change trust computation in this task.
+
+## Phase 6: Verification
+
+### [x] 11. Run a syntax/import check
+
+Run the lightest practical check available for the edited files, such as:
+
+```powershell
+python -m py_compile tmrl/custom/custom_algorithms.py
+```
+
+If project imports require unavailable runtime dependencies, document the blocker in the final response.
+
+### [x] 12. Handoff for review
+
+When all checklist items are complete:
+
+- Change the top of this file to `STATUS: REVIEW`.
+- Stop and report the implemented logging groups and verification result.

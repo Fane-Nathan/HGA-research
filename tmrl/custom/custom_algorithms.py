@@ -21,6 +21,77 @@ import tmrl.config.config_constants as cfg
 import logging
 
 
+def _add_tensor_stats(logs, prefix, x, dead_threshold=1e-3):
+    if logs is None or x is None:
+        return logs
+
+    with torch.no_grad():
+        x = x.detach()
+        if not x.is_floating_point():
+            x = x.float()
+
+        if x.numel() == 0:
+            logs[f"{prefix}_mean"] = 0.0
+            logs[f"{prefix}_std"] = 0.0
+            logs[f"{prefix}_abs_mean"] = 0.0
+            logs[f"{prefix}_min"] = 0.0
+            logs[f"{prefix}_max"] = 0.0
+            return logs
+
+        logs[f"{prefix}_mean"] = x.mean().item()
+        logs[f"{prefix}_std"] = x.std(unbiased=False).item()
+        logs[f"{prefix}_abs_mean"] = x.abs().mean().item()
+        logs[f"{prefix}_min"] = x.min().item()
+        logs[f"{prefix}_max"] = x.max().item()
+
+        if x.dim() >= 2 and x.shape[-1] > 0:
+            feature_view = x.reshape(-1, x.shape[-1])
+            dim_std = feature_view.std(dim=0, unbiased=False)
+            logs[f"{prefix}_dead_dim_ratio_1e3"] = (dim_std < dead_threshold).float().mean().item()
+            logs[f"{prefix}_dim_std_min"] = dim_std.min().item()
+            logs[f"{prefix}_dim_std_mean"] = dim_std.mean().item()
+            logs[f"{prefix}_dim_std_max"] = dim_std.max().item()
+
+    return logs
+
+
+def _parameter_grad_norm(parameters):
+    if parameters is None:
+        return 0.0
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+
+    total_sq_norm = 0.0
+    found_grad = False
+    for p in parameters:
+        if p is None or p.grad is None:
+            continue
+
+        grad = p.grad.detach()
+        if grad.is_sparse:
+            grad = grad.coalesce().values()
+        total_sq_norm += grad.norm(2).item() ** 2
+        found_grad = True
+
+    return total_sq_norm ** 0.5 if found_grad else 0.0
+
+
+def _module_grad_norm(module):
+    if module is None:
+        return 0.0
+    return _parameter_grad_norm(module.parameters())
+
+
+def _clear_parameter_grads(parameters):
+    if parameters is None:
+        return
+    if isinstance(parameters, torch.Tensor):
+        parameters = [parameters]
+    for p in parameters:
+        if p is not None:
+            p.grad = None
+
+
 # Soft Actor-Critic ====================================================================================================
 
 
@@ -618,7 +689,44 @@ class SharedBackboneREDQSACAgent(TrainingAgent):
         return ret_dict
 
 
-# ============== DroQ SAC Agent ==============
+# ============== GRAC: Gradient-Rescaled Actor-Critic Components ==============
+
+class GradientHealthTracker:
+    """
+    GHAE: Gradient-Health Adaptive Entropy (Novel — part of GRAC algorithm).
+
+    Tracks per-dimension gradient health of the actor's mu_layer and provides
+    entropy target boosts for dimensions with persistently vanishing gradients.
+
+    Creates a self-healing feedback loop:
+      vanishing gradients → more exploration → actions move from boundaries
+      → gradients recover → exploration decreases → exploitation resumes
+    """
+    def __init__(self, dim_act, ema_decay=0.99, threshold=0.01,
+                 boost=0.5, device='cpu'):
+        self.dim_act = dim_act
+        self.ema_decay = ema_decay
+        self.threshold = threshold
+        self.boost = boost
+        self.grad_health = torch.ones(dim_act, device=device)
+
+    def update(self, mu_layer_grad):
+        """Update health scores from mu_layer weight gradient."""
+        if mu_layer_grad is None:
+            return
+        # mu_layer.weight has shape (dim_act, hidden_dim)
+        # Per-dimension gradient magnitude (mean across input dims)
+        per_dim_mag = mu_layer_grad.abs().mean(dim=1)  # (dim_act,)
+        self.grad_health = (self.ema_decay * self.grad_health +
+                           (1 - self.ema_decay) * per_dim_mag.detach())
+
+    def get_entropy_boost(self):
+        """Compute per-dimension entropy target boost for unhealthy dims."""
+        deficit = torch.relu(self.threshold - self.grad_health)
+        return self.boost * deficit
+
+
+# ============== DroQ SAC Agent ==========================
 
 class DroQSACAgent(TrainingAgent):
     """
@@ -738,6 +846,14 @@ class DroQSACAgent(TrainingAgent):
         else:
             self.alpha_t = torch.full((dim_act,), float(self.alpha), device=self.device)
 
+        # GRAC: Gradient-Health Adaptive Entropy tracker (configurable from config.json)
+        ghae_threshold = cfg.TMRL_CONFIG.get("ALG", {}).get("GHAE_THRESHOLD", 0.02)
+        ghae_boost = cfg.TMRL_CONFIG.get("ALG", {}).get("GHAE_BOOST", 2.0)
+        self.grad_tracker = GradientHealthTracker(
+            dim_act=dim_act, device=self.device,
+            threshold=ghae_threshold, boost=ghae_boost
+        )
+
         # ── World Model (RSSM) ─────────────────────────────────────────────
         wm_cfg = cfg.TMRL_CONFIG.get("WORLD_MODEL", {})
         self.wm_enabled = wm_cfg.get("ENABLED", False)
@@ -779,6 +895,32 @@ class DroQSACAgent(TrainingAgent):
         # Avoid deepcopy-based export for DroQ models:
         # certain parametrized tensors are not deepcopy-compatible in recent torch.
         return self.model.actor
+
+    def _alpha_floor_tensor(self):
+        alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
+        dim_act = self.action_space.shape[0]
+        floor_all = float(alg_cfg.get("ALPHA_FLOOR", 0.0))
+        floor_cfg = alg_cfg.get("ALPHA_FLOOR_PER_DIM", None)
+        if floor_cfg is not None:
+            floors = [float(v) for v in floor_cfg]
+        else:
+            floors = [
+                float(alg_cfg.get("ALPHA_FLOOR_STEER", floor_all)),
+                float(alg_cfg.get("ALPHA_FLOOR_GAS", floor_all)),
+                float(alg_cfg.get("ALPHA_FLOOR_BRAKE", floor_all)),
+            ]
+        if len(floors) < dim_act:
+            floors.extend([floor_all] * (dim_act - len(floors)))
+        return torch.tensor(floors[:dim_act], device=self.device, dtype=torch.float32)
+
+    def _apply_alpha_floor(self):
+        floor = self._alpha_floor_tensor()
+        if self.learn_entropy_coef:
+            with torch.no_grad():
+                log_floor = torch.log(floor.clamp_min(1e-12))
+                self.log_alpha.data.copy_(torch.maximum(self.log_alpha.data, log_floor))
+            return torch.exp(self.log_alpha.detach()), floor
+        return torch.maximum(self.alpha_t, floor), floor
 
     # ── World Model helpers ──────────────────────────────────────────────
 
@@ -823,10 +965,30 @@ class DroQSACAgent(TrainingAgent):
         next_state = self._extract_critic_state(o2).detach()
         reward = r.unsqueeze(-1) if r.dim() == 1 else r  # (B, 1)
 
+        wm_input_metrics = {}
+        _add_tensor_stats(wm_input_metrics, "wm_input/state", state)
+        _add_tensor_stats(wm_input_metrics, "wm_input/next_state", next_state)
+        _add_tensor_stats(wm_input_metrics, "wm_input/action", a)
+        _add_tensor_stats(wm_input_metrics, "wm_input/reward", reward)
+        wm_input_metrics["bridge/context_z_to_wm_present"] = 1.0 if context_z is not None else 0.0
+        wm_input_metrics["bridge/context_z_requires_grad"] = float(context_z.requires_grad) if context_z is not None else 0.0
+        if context_z is not None:
+            _add_tensor_stats(wm_input_metrics, "wm_input/context_z", context_z)
+            _add_tensor_stats(wm_input_metrics, "bridge/context_z", context_z)
+
         loss, metrics = self.dynamics.train_step(state, a, next_state, reward, context_z=context_z)
+        metrics = dict(metrics or {})
+        metrics.update(wm_input_metrics)
 
         self.dynamics_optimizer.zero_grad()
         loss.backward()
+        metrics["wm_grad/encoder"] = _module_grad_norm(getattr(self.dynamics, "encoder", None))
+        metrics["wm_grad/prior"] = _module_grad_norm(getattr(self.dynamics, "prior", None))
+        metrics["wm_grad/posterior"] = _module_grad_norm(getattr(self.dynamics, "posterior", None))
+        decoder = getattr(self.dynamics, "decoder", None)
+        metrics["wm_grad/decoder"] = _module_grad_norm(getattr(decoder, "state_net", None))
+        metrics["wm_grad/reward_head"] = _module_grad_norm(getattr(decoder, "reward_net", None))
+        metrics["wm_grad/total"] = _module_grad_norm(self.dynamics)
         torch.nn.utils.clip_grad_norm_(self.dynamics.parameters(), 5.0)
         self.dynamics_optimizer.step()
 
@@ -846,7 +1008,7 @@ class DroQSACAgent(TrainingAgent):
             B = images.shape[0]
         return act1[:B].view(B, -1).detach(), act2[:B].view(B, -1).detach()
 
-    def _imagined_critic_update(self, o, ctx=None, context_z=None):
+    def _imagined_critic_update(self, o, ctx=None, context_z=None, real_action=None):
         """
         Generate imagined rollouts in latent space and perform Critic gradient updates.
         Uses the RSSM prior to roll forward, decodes to critic state, then
@@ -857,6 +1019,8 @@ class DroQSACAgent(TrainingAgent):
         state = state[:B]
         if context_z is not None:
             context_z = context_z[:B].detach()
+        if real_action is not None:
+            real_action = real_action[:B].detach()
 
         # Extract real previous actions from batch to seed action history
         real_act1, real_act2 = self._extract_prev_actions(o, B)  # (B, 3) each
@@ -878,8 +1042,22 @@ class DroQSACAgent(TrainingAgent):
         # Use the last decoded state + reward for a 1-step TD critic update
         # Take transitions from each horizon step as independent training data
         H = imag_states.shape[0]
+        imag_metrics = {}
+        for h in range(H):
+            _add_tensor_stats(imag_metrics, f"wm_imag/h{h}_state", imag_states[h])
+            _add_tensor_stats(imag_metrics, f"wm_imag/h{h}_action", imag_actions[h])
+            _add_tensor_stats(imag_metrics, f"wm_imag/h{h}_reward", imag_rewards[h])
+            if imag_uncertainties is not None:
+                _add_tensor_stats(imag_metrics, f"wm_imag/h{h}_uncertainty", imag_uncertainties[h])
+
+        imag_metrics["bridge/context_z_to_critic_present"] = 1.0 if context_z is not None else 0.0
+        imag_metrics["bridge/context_z_requires_grad"] = float(context_z.requires_grad) if context_z is not None else 0.0
+        if context_z is not None:
+            _add_tensor_stats(imag_metrics, "bridge/context_z", context_z)
+
         if H < 2:
-            return {"wm_imagined_steps": 0}
+            imag_metrics["wm_imagined_steps"] = 0
+            return imag_metrics
 
         # === Build proper action history for critic input ===
         # The real critic expects (state_28, act1=a_{t-1}, act2=a_{t-2}, z_64)
@@ -922,6 +1100,20 @@ class DroQSACAgent(TrainingAgent):
         act2_s = act2_stack[:-1].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
         act1_ns = act1_stack[1:].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
         act2_ns = act2_stack[1:].reshape(-1, self.dynamics.action_dim)   # ((H-1)*B, 3)
+
+        _add_tensor_stats(imag_metrics, "bridge/state_real", state)
+        _add_tensor_stats(imag_metrics, "bridge/state_imag", s_flat)
+        if state.shape[-1] == s_flat.shape[-1]:
+            imag_metrics["bridge/state_distribution_gap"] = (
+                state.detach().mean(dim=0) - s_flat.detach().mean(dim=0)
+            ).abs().mean().item()
+        if real_action is not None:
+            _add_tensor_stats(imag_metrics, "bridge/action_real", real_action)
+        _add_tensor_stats(imag_metrics, "bridge/action_imag", a_flat)
+        _add_tensor_stats(imag_metrics, "bridge/act1_real", real_act1)
+        _add_tensor_stats(imag_metrics, "bridge/act2_real", real_act2)
+        imag_metrics["bridge/act1_vs_imag_action_abs_diff"] = (act1_s.detach() - a_flat.detach()).abs().mean().item()
+        imag_metrics["bridge/act2_vs_act1_abs_diff"] = (act2_s.detach() - act1_s.detach()).abs().mean().item()
 
         # Compute target Q-values using imagined next states
         with torch.no_grad():
@@ -974,6 +1166,16 @@ class DroQSACAgent(TrainingAgent):
         q_pred_list = [q(critic_s, a_flat, film_params_grad) for q in self.model.qs]
         q_pred_cat = torch.stack(q_pred_list, -1)  # (N, 2)
         target_q_expanded = target_q.unsqueeze(-1).expand_as(q_pred_cat)
+        with torch.no_grad():
+            q_imag = q_pred_cat.detach()
+            target_q_detached = target_q.detach()
+            imag_td_error = q_imag - target_q_expanded.detach()
+            imag_metrics["bridge/q_imag_mean"] = q_imag.mean().item()
+            imag_metrics["bridge/q_imag_std"] = q_imag.std(unbiased=False).item()
+            imag_metrics["bridge/target_q_imag_mean"] = target_q_detached.mean().item()
+            imag_metrics["bridge/target_q_imag_std"] = target_q_detached.std(unbiased=False).item()
+            imag_metrics["bridge/imag_td_error_mean"] = imag_td_error.mean().item()
+            imag_metrics["bridge/imag_td_error_abs_mean"] = imag_td_error.abs().mean().item()
 
         loss_unreduced = F.mse_loss(q_pred_cat, target_q_expanded, reduction='none')
         
@@ -982,21 +1184,31 @@ class DroQSACAgent(TrainingAgent):
         lambda_trust = cfg.TMRL_CONFIG.get("ALG", {}).get("VERIFIER_LAMBDA", 10.0)
         m_t = torch.exp(-lambda_trust * u_t_flat)  # ((H-1)*B, 1)
         m_t_expanded = m_t.expand_as(loss_unreduced)
+        _add_tensor_stats(imag_metrics, "wm/verifier_uncertainty", u_t_flat)
+        _add_tensor_stats(imag_metrics, "wm/verifier_trust", m_t)
+        imag_metrics["wm/verifier_trust_saturation_low"] = (m_t.detach() < 0.05).float().mean().item()
+        imag_metrics["wm/verifier_trust_saturation_high"] = (m_t.detach() > 0.95).float().mean().item()
+        _add_tensor_stats(imag_metrics, "bridge/trust", m_t)
+        imag_metrics["bridge/trust_saturation_low"] = (m_t.detach() < 0.05).float().mean().item()
+        imag_metrics["bridge/trust_saturation_high"] = (m_t.detach() > 0.95).float().mean().item()
         
         # Weight loss by trust metric
         loss_q_imagined = (loss_unreduced * m_t_expanded).mean()
 
         self.q_optimizer.zero_grad()
         loss_q_imagined.backward()
-        torch.nn.utils.clip_grad_norm_(self._q_params, 1.0)
+        # Clip actor gradients loosely to prevent extreme spikes from deterministic pull
+        actor_grad_norm = torch.nn.utils.clip_grad_norm_(self._q_params, 1.0)
         self.q_optimizer.step()
 
-        return {
+        imag_metrics.update({
             "wm_imagined_steps": H * B,
             "wm_imagined_q_loss": loss_q_imagined.item(),
             "verifier_uncertainty_mean": u_t_flat.mean().item(),
             "verifier_trust_mt_mean": m_t.mean().item(),
-        }
+            "grad_norm_critic": actor_grad_norm.item(),
+        })
+        return imag_metrics
 
     # ── EWC: Elastic Weight Consolidation ────────────────────────────────
 
@@ -1116,8 +1328,10 @@ class DroQSACAgent(TrainingAgent):
         # Backward compatibility for checkpoints (init logic bypassed)
         if not hasattr(self, "q_updates_per_policy_update"):
              self.q_updates_per_policy_update = cfg.TMRL_CONFIG["ALG"]["REDQ_Q_UPDATES_PER_POLICY_UPDATE"]
-        # Always read alpha_floor from live config (not checkpoint) so config changes take effect on restart.
-        self.alpha_floor = cfg.TMRL_CONFIG.get("ALG", {}).get("ALPHA_FLOOR", 0.08)
+        if not hasattr(self, "det_reg_lambda"):
+             self.det_reg_lambda = cfg.TMRL_CONFIG.get("ALG", {}).get("DET_REG_LAMBDA", 0.01)
+        # Entropy is now fully managed by the Target Entropy controller (Auto-Annealer).
+        # We removed alpha_floor here to perfectly align the SAC optimizer.
 
         # Lazy-init World Model for checkpoints loaded via pickle (bypasses __init__)
         if not hasattr(self, "wm_enabled"):
@@ -1191,28 +1405,47 @@ class DroQSACAgent(TrainingAgent):
             ctx = None
             ctx_next = None
 
+        # Force update learning rates and target entropy from live config on every trainer restart.
+        # Uses a versioned flag so bumping the version forces re-application on existing checkpoints.
+        _OVERRIDE_VERSION = 3  # Bump this to force re-apply on next restart
+        if getattr(self, "_override_version", 0) < _OVERRIDE_VERSION:
+            import logging
+            new_lr_actor = 1e-4
+            new_lr_critic = 1e-4
+            for param_group in self.pi_optimizer.param_groups:
+                param_group['lr'] = new_lr_actor
+            for param_group in self.q_optimizer.param_groups:
+                param_group['lr'] = new_lr_critic
+            # Fix GAMMA baked in checkpoint
+            self.gamma = 0.99
+            # Refresh target entropy from live config.json (prevents entropy death spiral)
+            cfg_target = cfg.TMRL_CONFIG.get("ALG", {}).get("TARGET_ENTROPY", None)
+            if cfg_target is not None:
+                dim_act = self.action_space.shape[0]
+                per_dim = float(cfg_target) / dim_act
+                self.target_entropy = torch.full((dim_act,), per_dim, device=self.device)
+                logging.info(f" === OVERRIDE: TARGET_ENTROPY={per_dim:.2f} per dim (total={cfg_target}) ===")
+            # Refresh GHAE params from live config
+            ghae_threshold = cfg.TMRL_CONFIG.get("ALG", {}).get("GHAE_THRESHOLD", 0.02)
+            ghae_boost = cfg.TMRL_CONFIG.get("ALG", {}).get("GHAE_BOOST", 2.0)
+            if hasattr(self, 'grad_tracker'):
+                self.grad_tracker.threshold = ghae_threshold
+                self.grad_tracker.boost = ghae_boost
+                logging.info(f" === OVERRIDE: GHAE(threshold={ghae_threshold}, boost={ghae_boost}) ===")
+            alpha_floor_t = self._alpha_floor_tensor()
+            if alpha_floor_t.numel() >= 3:
+                logging.info(
+                    f" === OVERRIDE: ALPHA_FLOOR(steer={alpha_floor_t[0].item():.4f}, "
+                    f"gas={alpha_floor_t[1].item():.4f}, brake={alpha_floor_t[2].item():.4f}) ==="
+                )
+            logging.info(f" === OVERRIDE: LR(Actor={new_lr_actor}, Critic={new_lr_critic}), GAMMA=0.99 ===")
+            self._override_version = _OVERRIDE_VERSION
+
         # Ensure Q-networks are in training mode (dropout active)
         self.model.train()
 
         # Get current alpha
-        if self.learn_entropy_coef:
-            # Dynamic alpha floor: per-dimension (steer explores more than gas/brake)
-            # Steering needs more exploration (discovering turns is hard)
-            # Gas can exploit more (mostly accelerate)
-            # Brake needs least exploration
-            trust = getattr(self, '_last_verifier_trust', 1.0)
-            trust_modulator = 1.0 + (0.5 - trust)
-            trust_modulator = max(0.2, min(2.0, trust_modulator))  # Clamp between 0.2x and 2.0x
-
-            floor_multipliers = torch.tensor([1.5, 0.8, 0.5], device=self.device)  # [steer, gas, brake]
-            dynamic_floor = (self.alpha_floor * trust_modulator) * floor_multipliers
-            # NOTE: curiosity is decoupled from alpha floor to prevent feedback loops.
-            # Curiosity only affects the reward signal, not entropy.
-            with torch.no_grad():
-                self.log_alpha.data = torch.max(self.log_alpha.data, torch.log(dynamic_floor))
-            alpha_t = torch.exp(self.log_alpha.detach())
-        else:
-            alpha_t = self.alpha_t
+        alpha_t, alpha_floor_t = self._apply_alpha_floor()
 
         # Check if model supports FiLM context (None = Vanilla baseline)
         uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None
@@ -1283,15 +1516,18 @@ class DroQSACAgent(TrainingAgent):
             loss_kl = self.model.context_encoder.last_kl_div
             # β-VAE weighting: small enough not to overwhelm RL signal
             kl_beta = cfg.TMRL_CONFIG.get("ALG", {}).get("KL_BETA", 0.05)
-            loss_q = loss_q + kl_beta * loss_kl
+            # Free nats: allow a minimum KL without penalty to prevent posterior collapse.
+            # Without this, the KL term pushes q(z|c) → N(0,I), making z uninformative.
+            kl_free_nats = cfg.TMRL_CONFIG.get("ALG", {}).get("KL_FREE_NATS", 1.0)
+            loss_kl_clipped = torch.clamp(loss_kl - kl_free_nats, min=0.0)
+            loss_q = loss_q + kl_beta * loss_kl_clipped
 
         self.loss_q = loss_q.detach()
 
         self.q_optimizer.zero_grad()
         loss_q.backward()
         # Per-module gradient clipping: context encoder gets tighter clip
-        # because its gradients traveled through 15+ layers and are noisy
-        torch.nn.utils.clip_grad_norm_(self._q_params, 1.0)
+        q_grad_norm = torch.nn.utils.clip_grad_norm_(self._q_params, 1.0)
         torch.nn.utils.clip_grad_norm_(self._encoder_params, 1.0)
         if self._context_params:
             torch.nn.utils.clip_grad_norm_(self._context_params, 0.5)
@@ -1299,6 +1535,8 @@ class DroQSACAgent(TrainingAgent):
 
         # === Actor update ===
         loss_alpha = None
+        effective_target_entropy_diag = None
+        actor_bridge_metrics = {}
         if update_policy:
             for q in self.model.qs:
                 q.requires_grad_(False)
@@ -1319,29 +1557,110 @@ class DroQSACAgent(TrainingAgent):
             unc_bonus = cfg.TMRL_CONFIG.get("ALG", {}).get("UNCERTAINTY_BONUS", 0.0)
             kl_brake = cfg.TMRL_CONFIG.get("ALG", {}).get("KL_BRAKE", 0.0)
             q_target_pi = min_q_pi + (unc_bonus - kl_brake) * std_q_pi
+            actor_bridge_metrics["bridge/actor_action_requires_grad"] = float(pi.requires_grad)
+            actor_bridge_metrics["bridge/critic_input_requires_grad"] = float(critic_o_actor.requires_grad)
+            try:
+                dqda = torch.autograd.grad(
+                    q_target_pi.mean(), pi, retain_graph=True, allow_unused=True
+                )[0]
+            except RuntimeError:
+                dqda = None
+            if dqda is not None:
+                actor_bridge_metrics["bridge/dqda_norm"] = dqda.detach().norm(dim=-1).mean().item()
+                actor_bridge_metrics["bridge/dqda_abs_mean"] = dqda.detach().abs().mean().item()
+            else:
+                actor_bridge_metrics["bridge/dqda_norm"] = 0.0
+                actor_bridge_metrics["bridge/dqda_abs_mean"] = 0.0
 
             entropy_cost = (alpha_t * logp_per_dim).sum(dim=-1)
             loss_pi = (entropy_cost.unsqueeze(dim=-1) - q_target_pi).mean()
+
+            # === SBR: Steering-Only Boundary Repulsion (GRAC Component 3) ===
+            # Adapted "inverting gradients" concept: mild L2 penalty on steering
+            # to discourage gratuitous saturation that causes gradient death.
+            # Applied to steering ONLY (index 0) — gas/brake are unpenalized.
+            # Coefficient is ~200x smaller than reward signal to avoid sluggishness.
+            sbr_lambda = cfg.TMRL_CONFIG.get("ALG", {}).get("SBR_LAMBDA", 0.005)
+            steering_action = pi[:, 0]  # index 0 = steer
+            loss_sbr = sbr_lambda * (steering_action ** 2).mean()
+            loss_pi = loss_pi + loss_sbr
+
             # EWC: lighter penalty on actor (0.1x) to allow policy adaptation
             if self._ewc_active and self.ewc_lambda > 0:
                 loss_pi = loss_pi + self.ewc_lambda * 0.1 * self._ewc_loss()
 
-            # === Deterministic Regularization (DPG) ===
-            # Force μ to independently produce high-Q actions (TD3-style gradient)
-            det_lambda = cfg.TMRL_CONFIG.get("ALG", {}).get("DET_REG_LAMBDA", 0.0)
-            loss_det = torch.zeros(1, device=self.device)
+            # === Advantage-Weighted Deterministic Bridge (AWDB) ===
+            # Replaces volatile DPG mathematically with a normalized supervised teacher bridge.
+            # Pull dynamically from self so tracking_offline.py (Auto-Annealer) can control it
+            det_lambda = getattr(self, "det_reg_lambda", 0.05)
+            loss_awdb = torch.zeros(1, device=self.device)
             if det_lambda > 0:
-                pi_det, _, _ = self.model.actor_from_features(
-                    fused_o_actor, film_o_actor, test=True, with_logprob=False, z=z_actor)
-                qs_det = [q(critic_o_actor, pi_det, film_o_actor) for q in self.model.qs]
+                # To prevent vanishing gradients on track corners (where tanh squashes the derivative to 0),
+                # we must evaluate the MSE bridge mathematically BEFORE the tanh activation.
+                
+                # Extract the post-tanh squashed action (for Q-evaluation) and the pre-tanh 'mu' (for learning)
+                pi_det_squashed, _, _, mu_pre = self.model.actor_from_features(
+                    fused_o_actor, film_o_actor, test=True, with_logprob=False, z=z_actor, return_pretanh_mu=True)
+                
+                qs_det = [q(critic_o_actor, pi_det_squashed, film_o_actor) for q in self.model.qs]
                 min_q_det = torch.min(torch.stack(qs_det, -1), dim=1)[0]
-                loss_det = -min_q_det.mean()
-                loss_pi = loss_pi + det_lambda * loss_det
+                
+                # Advantage: How much better is the pure stochastic action (pi) vs deterministic action (pi_det)?
+                advantage = (q_target_pi - min_q_det).detach()
+                
+                # Only pull deterministic towards stochastic IF stochastic is actually better (adv > 0)
+                advantage_mask = torch.relu(advantage)
+                
+                # Reverse the successful stochastic 'pi' backwards into its pre-tanh infinite-space counterpart.
+                # We detach() it permanently so Atanh instability can never traverse back into the network gradients.
+                act_limit = getattr(self.model.actor, "act_limit", 1.0)
+                pi_scaled = (pi.detach() / act_limit).clamp(-0.99999, 0.99999)
+                pi_pre_target = torch.atanh(pi_scaled)
+                
+                # Direct pre-tanh Supervised Bridge (Absolutely zero vanishing gradients!)
+                mse_bridge = torch.nn.functional.mse_loss(mu_pre, pi_pre_target, reduction='none').mean(dim=-1, keepdim=True)
+                
+                # Normalize advantage to solve explosion gradients: map to [0, 1] range softly
+                adv_weight = advantage_mask / (advantage_mask.max() + 1e-8)
+                
+                loss_awdb = (mse_bridge * adv_weight).mean()
+                loss_pi = loss_pi + det_lambda * loss_awdb
 
             self.pi_optimizer.zero_grad()
             loss_pi.backward()
+
+            # GRAC: Update gradient health tracker AFTER backward, BEFORE optimizer step
+            if hasattr(self, 'grad_tracker') and self.model.actor.mu_layer.weight.grad is not None:
+                self.grad_tracker.update(self.model.actor.mu_layer.weight.grad)
+
+            alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
+            guard_enabled = alg_cfg.get("ACTOR_STABILITY_GUARD_ENABLED", True)
+            guard_dqda_min = float(alg_cfg.get("ACTOR_GUARD_DQDA_MIN_NORM", 1e-4))
+            guard_health_min = float(alg_cfg.get("ACTOR_GUARD_GRAD_HEALTH_MIN", 0.01))
+            if hasattr(self, 'grad_tracker'):
+                grad_health_mean = self.grad_tracker.grad_health.detach().mean().item()
+            else:
+                grad_health_mean = 1.0
+            dqda_norm_value = actor_bridge_metrics.get("bridge/dqda_norm", 0.0)
+            actor_stability_guard_active = (
+                guard_enabled
+                and dqda_norm_value < guard_dqda_min
+                and grad_health_mean < guard_health_min
+            )
+            actor_bridge_metrics["guard/actor_stability_active"] = float(actor_stability_guard_active)
+            actor_bridge_metrics["guard/actor_mu_step_blocked"] = float(actor_stability_guard_active)
+            actor_bridge_metrics["guard/actor_std_step_allowed"] = 1.0
+            actor_bridge_metrics["guard/dqda_min_norm"] = guard_dqda_min
+            actor_bridge_metrics["guard/grad_health_min"] = guard_health_min
+            actor_bridge_metrics["guard/grad_health_mean"] = grad_health_mean
+            if actor_stability_guard_active:
+                _clear_parameter_grads(
+                    list(self.model.actor.net.parameters()) +
+                    list(self.model.actor.mu_layer.parameters())
+                )
+
             # Per-module clipping for actor: std_net gets tighter clip
-            torch.nn.utils.clip_grad_norm_(
+            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(self.model.actor.net.parameters()) +
                 list(self.model.actor.mu_layer.parameters()), 1.0)
             torch.nn.utils.clip_grad_norm_(
@@ -1359,21 +1678,23 @@ class DroQSACAgent(TrainingAgent):
                     else:
                         fused_alpha, _, film_alpha, z_alpha = self.model.forward_features(o)
                 _, _, logp_per_dim_alpha = self.model.actor_from_features(fused_alpha, film_alpha, z=z_alpha)
-                loss_alpha = -(self.log_alpha * (logp_per_dim_alpha.detach().mean(dim=0) + self.target_entropy)).sum()
+                # Apply stall recovery entropy bump dynamically
+                stall_bump = getattr(self, "stall_entropy_bump", 0.0)
+                # GRAC: Apply GHAE entropy boost for dimensions with vanishing gradients
+                ghae_boost = torch.zeros_like(self.target_entropy)
+                if hasattr(self, 'grad_tracker'):
+                    ghae_boost = self.grad_tracker.get_entropy_boost()
+                # SAC target entropy is negative in this codepath. A positive
+                # exploration boost must therefore make the target more negative.
+                effective_target_entropy = self.target_entropy - stall_bump - ghae_boost
+                effective_target_entropy_diag = effective_target_entropy.detach()
+                
+                loss_alpha = -(self.log_alpha * (logp_per_dim_alpha.detach().mean(dim=0) + effective_target_entropy)).sum()
                 self.alpha_optimizer.zero_grad()
                 loss_alpha.backward()
                 torch.nn.utils.clip_grad_norm_(self.log_alpha, 1.0)
                 self.alpha_optimizer.step()
-
-                # Apply per-dimension entropy floor (same as top of train())
-                trust = getattr(self, '_last_verifier_trust', 1.0)
-                trust_modulator = 1.0 + (0.5 - trust)
-                trust_modulator = max(0.2, min(2.0, trust_modulator))
-
-                floor_multipliers = torch.tensor([1.5, 0.8, 0.5], device=self.device)
-                dynamic_floor = (self.alpha_floor * trust_modulator) * floor_multipliers
-                with torch.no_grad():
-                    self.log_alpha.data = torch.max(self.log_alpha.data, torch.log(dynamic_floor))
+                alpha_t, alpha_floor_t = self._apply_alpha_floor()
 
             self.loss_pi = loss_pi.detach()
 
@@ -1400,8 +1721,10 @@ class DroQSACAgent(TrainingAgent):
             loss_actor=self.loss_pi.detach().item(),
             loss_critic=self.loss_q.detach().item(),
         )
-        if update_policy and 'loss_det' in dir():
-            ret_dict["loss_det_reg"] = loss_det.detach().item() if isinstance(loss_det, torch.Tensor) else 0.0
+        if update_policy and 'loss_awdb' in dir():
+            ret_dict["loss_awdb"] = loss_awdb.detach().item() if isinstance(loss_awdb, torch.Tensor) else 0.0
+        if update_policy and 'loss_sbr' in dir():
+            ret_dict["loss_sbr"] = loss_sbr.detach().item() if isinstance(loss_sbr, torch.Tensor) else 0.0
         if self._ewc_active:
             ret_dict["ewc_loss"] = loss_ewc.detach().item() if 'loss_ewc' in dir() else 0.0
         if uses_context:
@@ -1409,8 +1732,37 @@ class DroQSACAgent(TrainingAgent):
         ret_dict["debug_alpha_steer"] = alpha_t[0].item()
         ret_dict["debug_alpha_gas"] = alpha_t[1].item()
         ret_dict["debug_alpha_brake"] = alpha_t[2].item()
+        ret_dict["debug_alpha_floor_steer"] = alpha_floor_t[0].item()
+        ret_dict["debug_alpha_floor_gas"] = alpha_floor_t[1].item()
+        ret_dict["debug_alpha_floor_brake"] = alpha_floor_t[2].item()
+        with torch.no_grad():
+            q_real = q_prediction_cat.detach()
+            ret_dict["bridge/q_real_mean"] = q_real.mean().item()
+            ret_dict["bridge/q_real_std"] = q_real.std(unbiased=False).item()
+        ret_dict.update(actor_bridge_metrics)
+
+        # Expose gradient movements for live tracking
+        if 'q_grad_norm' in locals() and isinstance(q_grad_norm, torch.Tensor):
+            ret_dict["grad_norm_critic"] = q_grad_norm.detach().item()
+        if 'actor_grad_norm' in locals() and isinstance(actor_grad_norm, torch.Tensor):
+            ret_dict["grad_norm_actor"] = actor_grad_norm.detach().item()
+
         ret_dict["debug_log_std_mean"] = log_std_diag.detach().mean().item()
         ret_dict["debug_log_std_min"] = log_std_diag.detach().min().item()
+
+        # GRAC diagnostics: gradient health and GHAE boost per dimension
+        if hasattr(self, 'grad_tracker'):
+            ret_dict["grad_health_steer"] = self.grad_tracker.grad_health[0].item()
+            ret_dict["grad_health_gas"] = self.grad_tracker.grad_health[1].item()
+            ret_dict["grad_health_brake"] = self.grad_tracker.grad_health[2].item()
+            ghae = self.grad_tracker.get_entropy_boost()
+            ret_dict["ghae_boost_steer"] = ghae[0].item()
+            ret_dict["ghae_boost_gas"] = ghae[1].item()
+            ret_dict["ghae_boost_brake"] = ghae[2].item()
+        if effective_target_entropy_diag is not None:
+            ret_dict["debug_target_entropy_steer"] = effective_target_entropy_diag[0].item()
+            ret_dict["debug_target_entropy_gas"] = effective_target_entropy_diag[1].item()
+            ret_dict["debug_target_entropy_brake"] = effective_target_entropy_diag[2].item()
 
         if self.learn_entropy_coef and loss_alpha is not None:
             ret_dict["loss_entropy_coef"] = loss_alpha.detach().item()
@@ -1422,6 +1774,7 @@ class DroQSACAgent(TrainingAgent):
             # z_actor is only available during policy updates, but WM trains every step
             wm_context_z = z_critic.detach() if z_critic is not None else None
             wm_metrics = self._train_dynamics(o, a, r, o2, context_z=wm_context_z)
+            ret_dict.update(wm_metrics)
             ret_dict["dynamics_loss"] = wm_metrics.get("wm_total_loss", 0.0)
             ret_dict["wm_train_steps"] = self.wm_train_steps
             ret_dict["wm_kl"] = wm_metrics.get("wm_kl", 0.0)
@@ -1438,8 +1791,14 @@ class DroQSACAgent(TrainingAgent):
             ret_dict["imag_actor_loss"] = imag_actor_loss.item()
 
             if self.wm_train_steps > self.wm_warmup:
-                imag_metrics = self._imagined_critic_update(o, ctx=ctx if uses_context else None, context_z=wm_context_z)
+                imag_metrics = self._imagined_critic_update(
+                    o, ctx=ctx if uses_context else None, context_z=wm_context_z, real_action=a.detach()
+                )
                 ret_dict.update(imag_metrics)
+                if "bridge/q_imag_mean" in imag_metrics and "bridge/q_real_mean" in ret_dict:
+                    ret_dict["bridge/q_imag_minus_real"] = (
+                        imag_metrics["bridge/q_imag_mean"] - ret_dict["bridge/q_real_mean"]
+                    )
                 self._last_verifier_trust = imag_metrics.get("verifier_trust_mt_mean", 1.0)
 
                 # Log curiosity bonus stats (uses normalized surprise)
@@ -1460,9 +1819,6 @@ class DroQSACAgent(TrainingAgent):
                 floor_mults = torch.tensor([1.5, 0.8, 0.5])
                 trust_mod = 1.0 + (0.5 - getattr(self, '_last_verifier_trust', 1.0))
                 trust_mod = max(0.2, min(2.0, trust_mod))
-                base = (self.alpha_floor * trust_mod) * floor_mults
-                ret_dict["dynamic_alpha_floor_steer"] = base[0].item()
-                ret_dict["dynamic_alpha_floor_gas"] = base[1].item()
-                ret_dict["dynamic_alpha_floor_brake"] = base[2].item()
+                # Removed dynamic_alpha_floor from logs as the metric is now organic alpha.
 
         return ret_dict
