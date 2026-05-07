@@ -52,8 +52,7 @@
     - [Full environment](#full-environment)
   - [TrackMania training details](#trackmania-training-details)
     - [RL basics](#reinforcement-learning-basics)
-    - [SAC](#soft-actor-critic)
-    - [REDQ](#randomized-ensembled-double-q-learning)
+    - [HGA](#hga-health-gated-algorithm)
     - [A clever reward](#a-clever-reward)
     - [Available action spaces](#available-action-spaces)
     - [Available observation spaces](#available-observation-spaces)
@@ -343,64 +342,22 @@ The reward received by the AI at each time-step is a measure of how well it perf
 
 In order to learn how to drive, the AI tries random actions in response to incoming observations, gets rewarded positively or negatively, and optimizes its policy so that its long-term reward is maximized.
 
-### Soft Actor-Critic
+### HGA: Health-Gated Algorithm
 
-([Introductory video](https://www.youtube.com/watch?v=LN29DDlHp1U))
+HGA (Health-Gated Algorithm), also known in our research as **SPECTRE-HGI** (Health-Gated Imagination Actor-Critic), is a novel reinforcement learning architecture that builds upon continuous stochastic controllers like SAC and REDQ, but introduces a powerful stability mechanism: **Health-Gated Imagination**.
 
-([Full paper](https://arxiv.org/abs/1801.01290))
+The core premise of HGA is that imagination (learning from simulated latent rollouts) is only allowed to train the actor/critic when both the **world model is trustworthy** and the **actor-critic learning signal is healthy**. 
 
-Soft Actor-Critic (SAC) is an algorithm that enables learning continuous stochastic controllers.
+Key features of our HGA architecture include:
 
-More specifically, SAC does this using two separate Artificial Neural Networks (NNs):
+- **HGI Trust Score**: We compute an `imag_trust` score based on:
+  - `model_trust`: Evaluating world-model uncertainty, surprise KL, reward prediction error, and prior/post reconstruction agreement.
+  - `critic_health`: Evaluating the critic's action sensitivity (`dqda_norm`), value stability (`q_pi_std`), and deterministic vs. stochastic return gaps.
+- **Dynamic Imagination Horizons**: Depending on the trust score, the algorithm skips imagined actor/critic updates entirely, shortens the imagination horizon, or uses the full configured horizon. This prevents the policy from collapsing due to hallucinations or unstable gradients.
+- **Actor and Critic Churn Regularization**: Soft EMA anchors penalize rapid, erratic drift in the actor's deterministic policy or the critic's value estimates, preserving safety during aggressive training.
+- **Health-Gated Entropy Floor**: Rather than a fixed entropy target, HGA dynamically lowers forced entropy when the actor churn is high, but restores the baseline floor when it detects starvation or unsafe signals.
 
-- The first one, called the "policy network" (or, in the literature, the "actor"), is the NN the user is ultimately interested in : the controller of the car.
-  It takes observations as input and outputs actions.
-- The second called the "value network" (or, in the literature, the "critic"), is used to train the policy network.
-  It takes an observation ```x``` and an action ```a``` as input, to output a value.
-  This value is an estimate of the expected sum of future rewards if the AI observes ```x```, selects ```a```, and then uses the policy network forever (there is also a discount factor so that this sum is not infinite).
-
-Both networks are trained in parallel using each other.
-The reward signal is used to train the value network, and the value network is used to train the policy network.
-
-Advantages of SAC over other existing methods are the following:
-- It is able to store transitions in a huge circular buffer called the "replay memory" and reuse these transitions several times during training.
-  This is an important property for applications such as TrackMania where only a relatively small number of transitions can be collected due to the Real-Time nature of the setting.
-- It is able to output analog controls. We use this property with a virtual gamepad.
-- It maximizes the entropy of the learned policy.
-  This means that the policy will be as random as possible while maximizing the reward.
-  This property helps explore the environment and is known to produce policies that are robust to external perturbations, which is of central importance in real-world self-driving scenarios.
-
-### Randomized Ensembled Double Q-Learning
-
-([Full paper](https://arxiv.org/abs/2101.05982))
-
-REDQ is a more recent methodology that improves the performance of value-based algorithms like SAC.
-
-The improvement introduced by REDQ consists essentially of training an ensemble of parallel value networks from which a subset is randomly sampled to evaluate target values during training.
-The authors show that this enables low-bias updates and a sample efficiency comparable to model-based algorithms, at a much lower computational cost.
-
-By default, `tmrl` trains policies with vanilla SAC.
-To use REDQ-SAC, edit `TmrlData\config\config.json` on the machine used for training, and replace the `"SAC"` value with `"REDQSAC"` in the `"ALGORITHM"` entry.
-You also need values for the `"REDQ_N"`, `"REDQ_M"` and `"REDQ_Q_UPDATES_PER_POLICY_UPDATE"` entries, where `"REDQ_N"` is the number of parallel critics, `"REDQ_M"` is the size of the subset, and `"REDQ_Q_UPDATES_PER_POLICY_UPDATE"` is a number of critic updates happenning between each actor update.
-
-For instance, a valid `"ALG"` entry using REDQ-SAC is:
-
-```json
-  "ALG": {
-    "ALGORITHM": "REDQSAC",
-    "LEARN_ENTROPY_COEF":false,
-    "LR_ACTOR":0.0003,
-    "LR_CRITIC":0.00005,
-    "LR_ENTROPY":0.0003,
-    "GAMMA":0.995,
-    "POLYAK":0.995,
-    "TARGET_ENTROPY":-7.0,
-    "ALPHA":0.37,
-    "REDQ_N":10,
-    "REDQ_M":2,
-    "REDQ_Q_UPDATES_PER_POLICY_UPDATE":20
-  },
-```
+This robust system ensures that the agent can aggressively learn from a predictive world model, but gracefully falls back to safe real-replay transitions whenever confidence in the internal simulation drops, completely resolving the cascading latent collapses often seen in aggressive model-based RL.
 
 ### A clever reward
 
