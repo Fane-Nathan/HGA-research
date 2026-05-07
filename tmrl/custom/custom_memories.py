@@ -69,14 +69,19 @@ def get_local_buffer_sample_tm20_hybrid(prev_act, obs, rew, terminated, truncate
     Sample compressor for MemoryTMHybrid (CNN + Lidar + XYZ + Progress)
     Input:
         prev_act: action computed from a previous observation
-        obs: (speed, gear, rpm, images, lidar, xyz, progress) after preprocessing
+        obs: (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain) after preprocessing
         rew, terminated, truncated, info: outcome of the transition
-    Compressed format: (speed, gear, rpm, image_single, lidar, xyz, progress)
+    Compressed format: (speed, gear, rpm, image_single, lidar, xyz, progress, crash, progress_gain)
     CAUTION: prev_act is the action that comes BEFORE obs
     """
     prev_act_mod = prev_act
     # obs[3] = images (4 frames), we take only the last frame and convert to uint8
-    obs_mod = (obs[0], obs[1], obs[2], (obs[3][-1] * 256.0).astype(np.uint8), obs[4], obs[5], obs[6])
+    crash = obs[7] if len(obs) > 7 else np.array([0.0], dtype=np.float32)
+    progress_gain = obs[8] if len(obs) > 8 else np.array([0.0], dtype=np.float32)
+    obs_mod = (
+        obs[0], obs[1], obs[2], (obs[3][-1] * 256.0).astype(np.uint8),
+        obs[4], obs[5], obs[6], crash, progress_gain
+    )
     rew_mod = rew
     terminated_mod = terminated
     truncated_mod = truncated
@@ -601,8 +606,8 @@ class MemoryTMFull(MemoryTM):
 class MemoryTMHybrid(MemoryTM):
     """
     Memory class for TM2020 Hybrid (CNN + Lidar) observations.
-    Observation format: (speed, gear, rpm, images, lidar, act1, act2)
-    This stores all 7 components including lidar for the HybridNanoEffNet models.
+    Observation format:
+    (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)
     """
     def __init__(self, *args, **kwargs):
         self.K_context = 16  # number of sequence steps for context
@@ -646,20 +651,24 @@ class MemoryTMHybrid(MemoryTM):
             replace_hist_before_eoe(hist=imgs_new_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset - 1)
             replace_hist_before_eoe(hist=imgs_last_obs, eoe_idx_in_hist=last_eoe_idx - self.start_imgs_offset)
 
-        # Safe fallback for legacy replay buffers lacking Asymmetric SAC's privileged xyz / progress state
+        # Safe fallback for legacy replay buffers lacking privileged hybrid state.
         # np.atleast_1d ensures shape is always (N,) even if the stored value is a bare scalar
         xyz_last = np.atleast_1d(self.data[12][idx_last]).astype(np.float32) if len(self.data) > 12 else np.zeros(3, dtype=np.float32)
         prog_last = np.atleast_1d(self.data[13][idx_last]).astype(np.float32) if len(self.data) > 13 else np.zeros(1, dtype=np.float32)
+        crash_last = np.atleast_1d(self.data[14][idx_last]).astype(np.float32) if len(self.data) > 14 else np.zeros(1, dtype=np.float32)
+        gain_last = np.atleast_1d(self.data[15][idx_last]).astype(np.float32) if len(self.data) > 15 else np.zeros(1, dtype=np.float32)
         xyz_now = np.atleast_1d(self.data[12][idx_now]).astype(np.float32) if len(self.data) > 12 else np.zeros(3, dtype=np.float32)
         prog_now = np.atleast_1d(self.data[13][idx_now]).astype(np.float32) if len(self.data) > 13 else np.zeros(1, dtype=np.float32)
+        crash_now = np.atleast_1d(self.data[14][idx_now]).astype(np.float32) if len(self.data) > 14 else np.zeros(1, dtype=np.float32)
+        gain_now = np.atleast_1d(self.data[15][idx_now]).astype(np.float32) if len(self.data) > 15 else np.zeros(1, dtype=np.float32)
 
-        # Observation format: (speed, gear, rpm, images, lidar, xyz, progress, act1, act2)
+        # Observation format: (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)
         last_obs = (self.data[2][idx_last], self.data[7][idx_last], self.data[8][idx_last], 
-                    imgs_last_obs, self.data[11][idx_last], xyz_last, prog_last, *last_act_buf)
+                    imgs_last_obs, self.data[11][idx_last], xyz_last, prog_last, crash_last, gain_last, *last_act_buf)
         new_act = self.data[1][idx_now]
         rew = np.float32(self.data[5][idx_now])
         new_obs = (self.data[2][idx_now], self.data[7][idx_now], self.data[8][idx_now], 
-                   imgs_new_obs, self.data[11][idx_now], xyz_now, prog_now, *new_act_buf)
+                   imgs_new_obs, self.data[11][idx_now], xyz_now, prog_now, crash_now, gain_now, *new_act_buf)
         terminated = self.data[9][idx_now]
         truncated = self.data[10][idx_now]
         info = self.data[6][idx_now]
@@ -668,9 +677,9 @@ class MemoryTMHybrid(MemoryTM):
         # Build K+1 steps so trainer can use:
         # - ctx      = context[:-1]  (ends at t)
         # - ctx_next = context[1:]   (ends at t+1)
-        # Telemetry Context: speed(1) + lidar(19) + action(3) = 23 (No Reward!)
+        # Telemetry Context: speed(1) + lidar(19) + action(3) + reward(1) = 24
         K = self.K_context
-        context = np.zeros((K + 1, 23), dtype=np.float32)
+        context = np.zeros((K + 1, 24), dtype=np.float32)
         # Image Context: 1 frame per step, size 64x64
         img_context = np.zeros((K + 1, 1, cfg.IMG_HEIGHT, cfg.IMG_WIDTH), dtype=np.float32)
 
@@ -690,9 +699,11 @@ class MemoryTMHybrid(MemoryTM):
             spd = np.float32(self.data[2][ctx_idx]).reshape(-1)[-1]
             lid = np.array(self.data[11][ctx_idx], dtype=np.float32).flatten()
             act_ctx = np.array(self.data[1][ctx_idx], dtype=np.float32).flatten()
+            rew_ctx = np.atleast_1d(self.data[5][ctx_idx]).astype(np.float32).reshape(-1)[-1]
             context[k, 0] = spd
             context[k, 1:20] = lid
             context[k, 20:23] = act_ctx
+            context[k, 23] = rew_ctx
 
             # Get image for this step
             img_frame = np.array(self.data[3][ctx_idx], dtype=np.float32) / 256.0
@@ -713,8 +724,9 @@ class MemoryTMHybrid(MemoryTM):
     def append_buffer(self, buffer):
         """
         buffer is a list of samples (act, obs, rew, terminated, truncated, info)
-        obs format from worker: (speed, gear, rpm, images, lidar, act1, act2) after preprocessing
-        But in the compressed sample, obs is (speed, gear, rpm, image_single, lidar)
+        obs format from worker:
+        (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)
+        In the compressed sample, obs keeps the latest image frame plus numeric fields.
         """
         first_data_idx = self.data[0][-1] + 1 if self.__len__() > 0 else 0
 
@@ -732,15 +744,21 @@ class MemoryTMHybrid(MemoryTM):
         d11 = [b[1][4] if len(b[1]) > 4 else np.zeros(19, dtype=np.float32) for b in buffer.memory]  # lidar
         d12 = [b[1][5] if len(b[1]) > 5 else np.zeros(3, dtype=np.float32) for b in buffer.memory]  # xyz
         d13 = [b[1][6] if len(b[1]) > 6 else np.array([0.0], dtype=np.float32) for b in buffer.memory]  # progress
+        d14 = [b[1][7] if len(b[1]) > 7 else np.array([0.0], dtype=np.float32) for b in buffer.memory]  # crash
+        d15 = [b[1][8] if len(b[1]) > 8 else np.array([0.0], dtype=np.float32) for b in buffer.memory]  # progress_gain
 
-        # Check and pad if loaded from a checkpoint with missing Asymmetric arrays
+        # Check and pad if loaded from a checkpoint with missing hybrid arrays.
         if self.__len__() > 0:
-            while len(self.data) < 14:
+            while len(self.data) < 16:
                 pad_len = len(self.data[0])
                 if len(self.data) == 12:
                     self.data.append([np.zeros(3, dtype=np.float32) for _ in range(pad_len)])  # 12: xyz
                 elif len(self.data) == 13:
                     self.data.append([np.array([0.0], dtype=np.float32) for _ in range(pad_len)])  # 13: progress
+                elif len(self.data) == 14:
+                    self.data.append([np.array([0.0], dtype=np.float32) for _ in range(pad_len)])  # 14: crash
+                elif len(self.data) == 15:
+                    self.data.append([np.array([0.0], dtype=np.float32) for _ in range(pad_len)])  # 15: progress_gain
                 else:
                     break
 
@@ -759,6 +777,8 @@ class MemoryTMHybrid(MemoryTM):
             self.data[11] += d11
             self.data[12] += d12
             self.data[13] += d13
+            self.data[14] += d14
+            self.data[15] += d15
         else:
             self.data.append(d0)
             self.data.append(d1)
@@ -774,6 +794,8 @@ class MemoryTMHybrid(MemoryTM):
             self.data.append(d11)
             self.data.append(d12)
             self.data.append(d13)
+            self.data.append(d14)
+            self.data.append(d15)
 
         to_trim = self.__len__() - self.memory_size
         if to_trim > 0:
@@ -791,5 +813,7 @@ class MemoryTMHybrid(MemoryTM):
             self.data[11] = self.data[11][to_trim:]
             self.data[12] = self.data[12][to_trim:]
             self.data[13] = self.data[13][to_trim:]
+            self.data[14] = self.data[14][to_trim:]
+            self.data[15] = self.data[15][to_trim:]
 
         return self

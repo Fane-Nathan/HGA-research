@@ -1,0 +1,18 @@
+STALL ANALYSIS REPORT
+=====================
+Stall Epoch: 16
+Best Eval MA10: 3.9645009029656646
+Current Eval MA10: 0.9288990711607038
+Stall Epochs Count: 13
+
+Details around Epoch 16:
+  Round 0: Train=9.37, Det=1.01, Stoch=9.59, CriticLoss=0.0051
+  Round 1: Train=8.50, Det=0.89, Stoch=9.44, CriticLoss=0.0050
+  Round 2: Train=9.38, Det=0.46, Stoch=8.91, CriticLoss=0.0047
+  Round 3: Train=8.51, Det=0.34, Stoch=15.31, CriticLoss=0.0047
+  Round 4: Train=9.47, Det=0.76, Stoch=22.94, CriticLoss=0.0043
+  Round 5: Train=9.09, Det=1.07, Stoch=9.57, CriticLoss=0.0044
+  Round 6: Train=23.12, Det=1.10, Stoch=21.68, CriticLoss=0.0040
+  Round 7: Train=29.94, Det=0.03, Stoch=8.98, CriticLoss=0.0039
+  Round 8: Train=22.47, Det=82.65, Stoch=9.57, CriticLoss=0.0044
+  Round 9: Train=15.97, Det=0.60, Stoch=14.78, CriticLoss=0.0037

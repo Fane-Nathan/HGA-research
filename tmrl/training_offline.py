@@ -13,7 +13,7 @@ from pandas import DataFrame
 
 # local imports
 import tmrl.config.config_constants as cfg
-from tmrl.util import pandas_dict
+from tmrl.util import dump, pandas_dict
 
 import logging
 
@@ -103,6 +103,91 @@ def compute_stall_dashboard(stall_state, warning_epochs=5):
     }
 
 
+def compute_hgi_det_stoch_gap_health(return_det, return_stoch, gap_warn=10.0):
+    """
+    Scores whether deterministic eval is tracking stochastic eval.
+    """
+    det = float(return_det)
+    stoch = float(return_stoch)
+    if stoch <= 0.0:
+        return 1.0
+    positive_gap = max(0.0, stoch - det)
+    abs_gap_health = max(0.0, min(1.0, 1.0 - positive_gap / max(float(gap_warn), 1e-12)))
+    ratio_health = max(0.0, min(1.0, det / max(stoch, 1e-12)))
+    return min(abs_gap_health, ratio_health) if positive_gap > 0.0 else 1.0
+
+
+def _safe_float(value, default=0.0):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if math.isnan(result):
+        return float(default)
+    return result
+
+
+def _safe_bool(value, default=True):
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("0", "false", "no", "off")
+    return bool(value)
+
+
+def compute_best_checkpoint_decision(metrics, best_state=None, alg_cfg=None):
+    """
+    Decides whether current eval metrics should preserve a best-eval checkpoint.
+    """
+    alg_cfg = alg_cfg or {}
+    best_state = best_state or {}
+
+    enabled = _safe_bool(alg_cfg.get("BEST_CHECKPOINT_ENABLED", True), True)
+    metric_name = str(alg_cfg.get("BEST_CHECKPOINT_METRIC", "return_test_det"))
+    min_return = _safe_float(alg_cfg.get("BEST_CHECKPOINT_MIN_RETURN", 50.0), 50.0)
+    tie_breaker_name = str(alg_cfg.get("BEST_CHECKPOINT_TIE_BREAKER", "episode_length_test_det"))
+
+    metric_value = _safe_float(metrics.get(metric_name), 0.0)
+    tie_breaker_value = _safe_float(metrics.get(tie_breaker_name), 0.0)
+    best_metric_value = _safe_float(best_state.get("best_metric_value"), float("-inf"))
+    best_tie_breaker_value = _safe_float(best_state.get("best_tie_breaker_value"), float("-inf"))
+
+    passes_threshold = metric_value >= min_return
+    improves_metric = metric_value > best_metric_value
+    improves_tie_breaker = metric_value == best_metric_value and tie_breaker_value > best_tie_breaker_value
+    triggered = bool(enabled and passes_threshold and (improves_metric or improves_tie_breaker))
+
+    return {
+        "triggered": triggered,
+        "enabled": enabled,
+        "metric_name": metric_name,
+        "metric_value": metric_value,
+        "min_return": min_return,
+        "tie_breaker_name": tie_breaker_name,
+        "tie_breaker_value": tie_breaker_value,
+        "best_metric_value": best_metric_value,
+        "best_tie_breaker_value": best_tie_breaker_value,
+    }
+
+
+def _update_hgi_eval_gap_metrics(metrics):
+    alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
+    gap_warn = float(alg_cfg.get("HGI_DET_STOCH_GAP_WARN", 10.0))
+    gap_health = compute_hgi_det_stoch_gap_health(
+        metrics.get("return_test_det", 0.0),
+        metrics.get("return_test_stoch", 0.0),
+        gap_warn=gap_warn,
+    )
+    metrics["hgi/det_stoch_gap_health"] = gap_health
+    if "hgi/critic_health" in metrics:
+        critic_health_pre_eval = float(metrics.get("hgi/critic_health", 1.0))
+        metrics["hgi/critic_health_pre_eval"] = critic_health_pre_eval
+        metrics["hgi/critic_health"] = min(critic_health_pre_eval, gap_health)
+        if "hgi/model_trust" in metrics:
+            model_trust = float(metrics.get("hgi/model_trust", 0.0))
+            metrics["hgi/imag_trust"] = max(0.0, min(1.0, model_trust * metrics["hgi/critic_health"]))
+
+
 def _format_metric_value(value):
     try:
         val = float(value)
@@ -114,6 +199,166 @@ def _format_metric_value(value):
     if abs(val) >= 10000.0 or (0.0 < abs(val) < 0.0001):
         return f"{val:.4e}"
     return f"{val:.6f}".rstrip("0").rstrip(".")
+
+
+STABLE_CSV_COLUMNS = (
+    "wall_clock_seconds",
+    "epoch",
+    "round",
+    "memory_len",
+    "round_time",
+    "return_test",
+    "return_test_det",
+    "return_test_stoch",
+    "return_test_det_stoch_gap",
+    "return_train",
+    "episode_length_test",
+    "episode_length_test_det",
+    "episode_length_test_stoch",
+    "episode_length_train",
+    "best_checkpoint/triggered",
+    "best_checkpoint/best_return_test_det",
+    "best_checkpoint/best_epoch",
+    "best_checkpoint/best_round",
+    "best_checkpoint/save_failed",
+    "debug_alpha_steer",
+    "debug_alpha_gas",
+    "debug_alpha_brake",
+    "debug_alpha_floor_steer",
+    "debug_alpha_floor_gas",
+    "debug_alpha_floor_brake",
+    "debug_log_std_mean",
+    "debug_log_std_min",
+    "loss_entropy_coef",
+    "entropy_coef",
+    "skill_transfer/stoch_adv_drive_ema",
+    "skill_transfer/det_adv_drive_ema",
+    "skill_transfer/det_lambda_eff",
+    "skill_transfer/min_awdb_weight_eff",
+    "skill_transfer/min_awdb_weight_target",
+    "skill_transfer/min_awdb_weight_applied",
+    "skill_transfer/loss_log_std_ceiling_weighted",
+    "skill_transfer/log_std_above_ceiling",
+    "loss_critic",
+    "bridge/dqda_norm",
+    "bridge/q_pi_std",
+    "bridge/q_action_sensitivity",
+    "hgi/model_trust",
+    "hgi/critic_health",
+    "hgi/imag_trust",
+    "wm_kl",
+    "wm/reward_error_abs_mean",
+    "wm_imagined_steps",
+)
+
+
+def _json_safe_metric(value):
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu()
+        if value.numel() == 1:
+            value = value.item()
+        else:
+            return _json_safe_metric(value.tolist())
+
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            value = value.item()
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe_metric(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_metric(v) for v in value]
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return int(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return str(value)
+        return float(value)
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _csv_safe_metric(value):
+    if value is None:
+        return ""
+    value = _json_safe_metric(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return str(value)
+        return f"{value:.6f}".rstrip("0").rstrip(".")
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+    return str(value)
+
+
+class MetricsWriter:
+    """
+    Writes full-fidelity metrics to JSONL and a fixed-width dashboard CSV.
+    """
+
+    def __init__(self, ablation_dir, run_name, start_time=None):
+        self.ablation_dir = Path(ablation_dir)
+        self.ablation_dir.mkdir(parents=True, exist_ok=True)
+        self.run_name = str(run_name)
+        self.stable_path = self.ablation_dir / f"{self.run_name}.stable.csv"
+        self.jsonl_path = self.ablation_dir / f"{self.run_name}.metrics.jsonl"
+        self.start_time = time.time() if start_time is None else float(start_time)
+        self._seen_keys = set()
+
+        self.stable_header_written = self.stable_path.exists() and self.stable_path.stat().st_size > 0
+        self.stable_file = open(self.stable_path, "a", newline="", encoding="utf-8")
+        self.stable_writer = csv.writer(self.stable_file)
+        if not self.stable_header_written:
+            self.stable_writer.writerow(STABLE_CSV_COLUMNS)
+            self.stable_file.flush()
+            self.stable_header_written = True
+
+        self.jsonl_file = open(self.jsonl_path, "a", encoding="utf-8")
+
+    @staticmethod
+    def _metrics_to_dict(metrics):
+        if hasattr(metrics, "to_dict"):
+            metrics = metrics.to_dict()
+        return {str(key): value for key, value in dict(metrics).items()}
+
+    def write(self, metrics, epoch, rnd, wall_clock_seconds=None):
+        raw_metrics = self._metrics_to_dict(metrics)
+        metric_keys = set(raw_metrics)
+        new_keys = sorted(metric_keys - self._seen_keys)
+        self._seen_keys.update(metric_keys)
+
+        elapsed = time.time() - self.start_time if wall_clock_seconds is None else float(wall_clock_seconds)
+        base_metrics = {
+            "wall_clock_seconds": elapsed,
+            "epoch": int(epoch),
+            "round": int(rnd),
+        }
+
+        record = {key: _json_safe_metric(value) for key, value in raw_metrics.items()}
+        record.update(base_metrics)
+        record["metrics/schema_key_count"] = len(metric_keys)
+        record["metrics/new_key_count"] = len(new_keys)
+        record["metrics/new_keys_sample"] = new_keys[:20]
+        self.jsonl_file.write(json.dumps(record, separators=(",", ":"), sort_keys=True, allow_nan=False) + "\n")
+        self.jsonl_file.flush()
+
+        stable_source = dict(raw_metrics)
+        stable_source.update(base_metrics)
+        self.stable_writer.writerow([_csv_safe_metric(stable_source.get(column, "")) for column in STABLE_CSV_COLUMNS])
+        self.stable_file.flush()
+
+    def close(self):
+        for handle_name in ("stable_file", "jsonl_file"):
+            handle = getattr(self, handle_name, None)
+            if handle is not None and not handle.closed:
+                handle.close()
 
 
 def _metric_matches(key, exact=(), prefixes=()):
@@ -147,7 +392,7 @@ def _format_sectioned_stats(stats_series):
             "TRUST / UNCERTAINTY",
             {
                 "exact": (),
-                "prefixes": ("verifier_", "wm/verifier_", "bridge/trust"),
+                "prefixes": ("hgi/", "verifier_", "wm/verifier_", "bridge/trust"),
             },
         ),
         (
@@ -261,9 +506,10 @@ class TrainingOffline:
         self.total_samples = len(self.memory)
         logging.info(f" Initial total_samples:{self.total_samples}")
 
-        # === CSV Logger for Ablation Study ===
+        # === Metrics logger for ablation study ===
         self._init_csv_logger()
         self._ensure_stall_tracking_state()
+        self._ensure_best_checkpoint_state()
 
     def _resolve_run_name(self):
         """Resolve run name from env override, then config.json, then fallback."""
@@ -285,21 +531,23 @@ class TrainingOffline:
         return "default"
 
     def _init_csv_logger(self):
-        """Initialize CSV logger (called from __post_init__ and __setstate__)."""
-        self._csv_file = None
-        self._csv_writer = None
+        """Initialize metrics logger (called from __post_init__ and __setstate__)."""
+        self._metrics_writer = None
         self._training_start_time = time.time()
         ablation_dir = Path(os.environ.get("TMRL_ABLATION_DIR", Path.home() / "TmrlData" / "ablation"))
         ablation_dir.mkdir(parents=True, exist_ok=True)
         run_name = self._resolve_run_name()
-        csv_path = ablation_dir / f"{run_name}.csv"
-        csv_has_content = csv_path.exists() and csv_path.stat().st_size > 0
-        self._csv_file = open(csv_path, "a", newline="")
-        self._csv_writer = csv.writer(self._csv_file)
-        self._csv_header_written = csv_has_content
-        self._csv_path = csv_path
+        self._metrics_writer = MetricsWriter(
+            ablation_dir=ablation_dir,
+            run_name=run_name,
+            start_time=self._training_start_time,
+        )
+        self._csv_path = self._metrics_writer.stable_path
+        self._jsonl_metrics_path = self._metrics_writer.jsonl_path
+        self._csv_header_written = self._metrics_writer.stable_header_written
         self._stall_diag_path = ablation_dir / f"{run_name}_stall.json"
-        logging.info(f" CSV logging to: {csv_path}")
+        logging.info(f" stable CSV logging to: {self._csv_path}")
+        logging.info(f" full metrics JSONL logging to: {self._jsonl_metrics_path}")
 
     def _ensure_stall_tracking_state(self):
         alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
@@ -322,6 +570,106 @@ class TrainingOffline:
             self._stall_last_auto_action = "none"
         if not hasattr(self, "_stall_last_action_epoch"):
             self._stall_last_action_epoch = -1
+
+    def _ensure_best_checkpoint_state(self):
+        # Backward-compatible defaults for older trainer checkpoints.
+        if not hasattr(self, "best_return_test_det"):
+            self.best_return_test_det = 0.0
+        if not hasattr(self, "best_return_test_stoch"):
+            self.best_return_test_stoch = 0.0
+        if not hasattr(self, "best_return_test"):
+            self.best_return_test = 0.0
+        if not hasattr(self, "best_eval_epoch"):
+            self.best_eval_epoch = -1
+        if not hasattr(self, "best_eval_round"):
+            self.best_eval_round = -1
+        if not hasattr(self, "_best_checkpoint_metric_value"):
+            self._best_checkpoint_metric_value = float("-inf")
+        if not hasattr(self, "_best_checkpoint_tie_breaker_value"):
+            self._best_checkpoint_tie_breaker_value = float("-inf")
+        if not hasattr(self, "_best_checkpoint_episode_length_test_det"):
+            self._best_checkpoint_episode_length_test_det = 0.0
+
+    def _best_checkpoint_path(self, alg_cfg):
+        override = alg_cfg.get("BEST_CHECKPOINT_PATH")
+        if override:
+            return str(Path(os.path.expanduser(str(override))))
+
+        checkpoint_path = Path(cfg.CHECKPOINT_PATH)
+        stem = checkpoint_path.stem
+        if stem.endswith("_t"):
+            best_stem = stem[:-2] + "_best_eval_t"
+        else:
+            best_stem = stem + "_best_eval"
+        return str(checkpoint_path.with_name(best_stem + checkpoint_path.suffix))
+
+    def _best_checkpoint_state(self):
+        return {
+            "best_metric_value": self._best_checkpoint_metric_value,
+            "best_tie_breaker_value": self._best_checkpoint_tie_breaker_value,
+        }
+
+    def _set_best_checkpoint_state(self, metrics, decision, rnd):
+        self.best_return_test_det = _safe_float(metrics.get("return_test_det"), self.best_return_test_det)
+        self.best_return_test_stoch = _safe_float(metrics.get("return_test_stoch"), self.best_return_test_stoch)
+        self.best_return_test = _safe_float(metrics.get("return_test"), self.best_return_test)
+        self.best_eval_epoch = int(self.epoch)
+        self.best_eval_round = int(rnd)
+        self._best_checkpoint_metric_value = decision["metric_value"]
+        self._best_checkpoint_tie_breaker_value = decision["tie_breaker_value"]
+        self._best_checkpoint_episode_length_test_det = _safe_float(
+            metrics.get("episode_length_test_det"),
+            self._best_checkpoint_episode_length_test_det,
+        )
+
+    def _best_checkpoint_log_metrics(self, triggered=0.0, save_failed=0.0):
+        return {
+            "best_checkpoint/triggered": float(triggered),
+            "best_checkpoint/best_return_test_det": float(self.best_return_test_det),
+            "best_checkpoint/best_epoch": int(self.best_eval_epoch),
+            "best_checkpoint/best_round": int(self.best_eval_round),
+            "best_checkpoint/save_failed": float(save_failed),
+        }
+
+    def _maybe_save_best_checkpoint(self, metrics, rnd):
+        self._ensure_best_checkpoint_state()
+        alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
+        decision = compute_best_checkpoint_decision(
+            metrics=metrics,
+            best_state=self._best_checkpoint_state(),
+            alg_cfg=alg_cfg,
+        )
+
+        if not decision["triggered"]:
+            return self._best_checkpoint_log_metrics(triggered=0.0)
+
+        previous_state = {
+            "best_return_test_det": self.best_return_test_det,
+            "best_return_test_stoch": self.best_return_test_stoch,
+            "best_return_test": self.best_return_test,
+            "best_eval_epoch": self.best_eval_epoch,
+            "best_eval_round": self.best_eval_round,
+            "_best_checkpoint_metric_value": self._best_checkpoint_metric_value,
+            "_best_checkpoint_tie_breaker_value": self._best_checkpoint_tie_breaker_value,
+            "_best_checkpoint_episode_length_test_det": self._best_checkpoint_episode_length_test_det,
+        }
+
+        self._set_best_checkpoint_state(metrics, decision, rnd)
+        best_path = Path(self._best_checkpoint_path(alg_cfg))
+        try:
+            best_path.parent.mkdir(parents=True, exist_ok=True)
+            logging.info(
+                f" saving best eval checkpoint: metric={decision['metric_name']} "
+                f"value={decision['metric_value']:.6f}, path={best_path}"
+            )
+            dump(self, best_path)
+            logging.info(f" saved best eval checkpoint: {best_path}")
+            return self._best_checkpoint_log_metrics(triggered=1.0)
+        except Exception as exc:
+            for key, value in previous_state.items():
+                setattr(self, key, value)
+            logging.exception(f" failed to save best eval checkpoint to {best_path}: {exc}")
+            return self._best_checkpoint_log_metrics(triggered=0.0, save_failed=1.0)
 
     def _apply_auto_stall_recovery(self, stall_state):
         """
@@ -407,13 +755,15 @@ class TrainingOffline:
         eval_mode = str(getattr(cfg, "TEST_EVAL_MODE", "dual")).lower()
         eval_epoch_return_det = float(sum(float(s.get("return_test_det", s.get("return_test", 0.0))) for s in epoch_stats) / len(epoch_stats))
         eval_epoch_return_stoch = float(sum(float(s.get("return_test_stoch", s.get("return_test", 0.0))) for s in epoch_stats) / len(epoch_stats))
+        eval_det_stoch_gap = eval_epoch_return_stoch - eval_epoch_return_det
         if eval_mode == "deterministic":
             eval_epoch_return = eval_epoch_return_det
         elif eval_mode == "stochastic":
             eval_epoch_return = eval_epoch_return_stoch
         else:
-            # In dual mode, we track both exploitation quality and exploratory quality.
-            eval_epoch_return = 0.5 * (eval_epoch_return_det + eval_epoch_return_stoch)
+            # In dual mode, deterministic exploitation is the primary health signal.
+            # Stochastic success with dead deterministic return is actor starvation, not a healthy run.
+            eval_epoch_return = eval_epoch_return_det
         self._eval_epoch_returns.append(eval_epoch_return)
 
         state = compute_stall_state(
@@ -435,6 +785,7 @@ class TrainingOffline:
             "eval_epoch_return": eval_epoch_return,
             "eval_epoch_return_det": eval_epoch_return_det,
             "eval_epoch_return_stoch": eval_epoch_return_stoch,
+            "eval_det_stoch_gap": eval_det_stoch_gap,
             "train_epoch_return": train_epoch_return,
             "eval_return_ma10": state["eval_return_ma10"],
             "train_return_ma10": state["train_return_ma10"],
@@ -453,9 +804,17 @@ class TrainingOffline:
 
         logging.info(
             f" Stall diagnostics: eval_mode={eval_mode}, eval_return_ma10={state['eval_return_ma10']:.6f}, "
+            f"eval_det={eval_epoch_return_det:.6f}, eval_stoch={eval_epoch_return_stoch:.6f}, "
+            f"det_stoch_gap={eval_det_stoch_gap:.6f}, "
             f"train_return_ma10={state['train_return_ma10']:.6f}, "
             f"stalled={state['stalled']}, stall_epochs={state['stall_epochs']}"
         )
+        if eval_mode == "dual" and eval_epoch_return_stoch > 0.5 and eval_det_stoch_gap > max(0.5, 2.0 * max(eval_epoch_return_det, 0.0)):
+            logging.warning(
+                " Deterministic starvation warning: stochastic eval is healthy "
+                f"({eval_epoch_return_stoch:.6f}) but deterministic eval is weak "
+                f"({eval_epoch_return_det:.6f})."
+            )
         logging.info(
             f" Anti-stall dashboard: status={dashboard['status']}, "
             f"auto_action={auto_action}, "
@@ -521,19 +880,22 @@ class TrainingOffline:
                 self.agent.det_reg_lambda = target_lambda
 
     def __getstate__(self):
-        """Exclude unpicklable CSV file handle from checkpoint."""
+        """Exclude unpicklable metrics file handles from checkpoint."""
         state = self.__dict__.copy()
+        state.pop('_metrics_writer', None)
         state.pop('_csv_file', None)
         state.pop('_csv_writer', None)
         state.pop('_csv_header_written', None)
+        state.pop('_jsonl_metrics_path', None)
         state.pop('_training_start_time', None)
         return state
 
     def __setstate__(self, state):
-        """Reinitialize CSV logger after loading checkpoint."""
+        """Reinitialize metrics logger after loading checkpoint."""
         self.__dict__.update(state)
         self._init_csv_logger()
         self._ensure_stall_tracking_state()
+        self._ensure_best_checkpoint_state()
 
     def update_buffer(self, interface):
         buffer = interface.retrieve_buffer()
@@ -600,6 +962,9 @@ class TrainingOffline:
                     stats_training_dict["episode_length_test"] = self.memory.stat_test_steps
                     stats_training_dict["return_test_det"] = getattr(self.memory, "stat_test_return_det", self.memory.stat_test_return)
                     stats_training_dict["return_test_stoch"] = getattr(self.memory, "stat_test_return_stoch", self.memory.stat_test_return)
+                    stats_training_dict["return_test_det_stoch_gap"] = (
+                        stats_training_dict["return_test_stoch"] - stats_training_dict["return_test_det"]
+                    )
                     stats_training_dict["episode_length_test_det"] = getattr(self.memory, "stat_test_steps_det", self.memory.stat_test_steps)
                     stats_training_dict["episode_length_test_stoch"] = getattr(self.memory, "stat_test_steps_stoch", self.memory.stat_test_steps)
                 else:
@@ -607,8 +972,14 @@ class TrainingOffline:
                     stats_training_dict["episode_length_test"] = 0.0
                     stats_training_dict["return_test_det"] = 0.0
                     stats_training_dict["return_test_stoch"] = 0.0
+                    stats_training_dict["return_test_det_stoch_gap"] = 0.0
                     stats_training_dict["episode_length_test_det"] = 0.0
                     stats_training_dict["episode_length_test_stoch"] = 0.0
+                _update_hgi_eval_gap_metrics(stats_training_dict)
+                skill_feedback_hook = getattr(self.agent, "update_det_skill_transfer_feedback", None)
+                if callable(skill_feedback_hook):
+                    for key, value in skill_feedback_hook(stats_training_dict).items():
+                        stats_training_dict[key] = value
                 stats_training_dict["return_train"] = self.memory.stat_train_return
                 stats_training_dict["episode_length_train"] = self.memory.stat_train_steps
                 stats_training_dict["sampling_duration"] = t_sample - t_sample_prev
@@ -630,20 +1001,21 @@ class TrainingOffline:
             train_time = t3 - t2
             logging.debug(f"round_time:{round_time}, idle_time:{idle_time}, update_buf_time:{update_buf_time}, train_time:{train_time}")
             stats += pandas_dict(memory_len=len(self.memory), round_time=round_time, idle_time=idle_time, **DataFrame(stats_training).mean(skipna=True)),
+            for key, value in self._maybe_save_best_checkpoint(stats[-1], rnd).items():
+                stats[-1][key] = value
+            entropy_floor_hook = getattr(self.agent, "update_entropy_floor_controller", None)
+            if callable(entropy_floor_hook):
+                round_diag = stats[-1].to_dict() if hasattr(stats[-1], "to_dict") else dict(stats[-1])
+                for key, value in entropy_floor_hook(round_diag).items():
+                    stats[-1][key] = value
 
             logging.info("\n" + _format_sectioned_stats(stats[-1]))
 
-            # === CSV: append round metrics ===
-            if getattr(self, '_csv_writer', None) is not None:
-                row_data = stats[-1]
-                if not self._csv_header_written:
-                    header = ["wall_clock_seconds", "epoch", "round"] + list(row_data.index)
-                    self._csv_writer.writerow(header)
-                    self._csv_header_written = True
+            metrics_writer = getattr(self, "_metrics_writer", None)
+            if metrics_writer is not None:
                 elapsed = time.time() - self._training_start_time
-                values = [f"{elapsed:.1f}", self.epoch, rnd] + [f"{v:.6f}" if isinstance(v, float) else str(v) for v in row_data.values]
-                self._csv_writer.writerow(values)
-                self._csv_file.flush()
+                metrics_writer.write(stats[-1], epoch=self.epoch, rnd=rnd, wall_clock_seconds=elapsed)
+                self._csv_header_written = metrics_writer.stable_header_written
 
             if self.profiling:
                 pro.stop()

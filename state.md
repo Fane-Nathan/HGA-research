@@ -1,284 +1,209 @@
 STATUS: REVIEW
 
-# TMRL WM + Bridge Gradient-Pass Logging Plan
-
-## Objective
-Add lightweight diagnostics for each training gradient pass so we can see whether the world model, context bridge, imagined rollout bridge, critic bridge, and actor-gradient bridge are healthy.
-
-The goal is observability only. Do not change the core Meta-RL agent structure, training loops, model architecture, optimizer behavior, or loss definitions unless a checklist item explicitly says so.
-
-## Phase 1: Shared Logging Helpers
-
-_Primary file: `tmrl/custom/custom_algorithms.py`_
-
-### [x] 1. Add tensor-stat and gradient-norm helpers
-
-Add small local helpers near the existing algorithm utilities:
-
-```python
-def _add_tensor_stats(logs, prefix, x, dead_threshold=1e-3):
-    ...
-
-def _module_grad_norm(module):
-    ...
-
-def _parameter_grad_norm(parameters):
-    ...
-```
-
-Requirements:
+# SPECTRE-HGI: Health-Gated Imagination Actor-Critic
+
+## Summary
+Build the novel direction around **Health-Gated Imagination**: imagination is allowed to train the actor/critic only when both the **world model is trustworthy** and the **actor-critic learning signal is healthy**.
+
+This differs from DreamerV3, MBPO, M2AC/MACURA, and PAVE:
+- DreamerV3 trains heavily from imagined latent rollouts: [DreamerV3](https://arxiv.org/abs/2301.04104)
+- M2AC/MACURA gate model rollouts by model uncertainty: [M2AC](https://papers.nips.cc/paper_files/paper/2020/hash/77133be2e96a577bd4794928976d2ae2-Abstract.html), [MACURA](https://arxiv.org/abs/2405.19014)
+- PAVE regularizes critic action-gradient geometry: [PAVE](https://arxiv.org/abs/2601.22970)
+- SPECTRE-HGI’s novelty target is: **model-based imagination gated by actor-critic health signals such as `dQ/dA`, `q_pi_std`, critic action sensitivity, gradient health, and deterministic/stochastic divergence.**
+
+## Key Changes
+- Add an HGI trust score:
+  - `model_trust`: based on world-model uncertainty, surprise KL, reward prediction error, and prior/post reconstruction agreement.
+  - `critic_health`: based on `bridge/dqda_norm`, `bridge/q_pi_std`, `bridge/q_action_sensitivity`, `grad_health_mean`, guard tier, and deterministic/stochastic return gap.
+  - `imag_trust = model_trust * critic_health`.
+
+- Use `imag_trust` to control imagination:
+  - below threshold: skip imagined actor/critic update for that batch;
+  - medium trust: use short-horizon imagination;
+  - high trust: use full configured imagination horizon;
+  - always keep real replay critic learning active.
+
+- Keep PAVE-style pieces as support, not the main novelty:
+  - keep the current `q_action_sensitivity` floor;
+  - optionally add a small Q-gradient consistency loss later;
+  - treat PAVE as a baseline/prior-art comparison, not the identity of the algorithm.
+
+- Fix current guard behavior before adding more complexity:
+  - `grad_health_low` alone should not force `lr_scale=0.1` when `dqda_norm`, `q_pi_std`, and deterministic return are healthy;
+  - reserve hard throttling for explosion, severe gradient collapse, or deterministic failure;
+  - log `guard/throttle_reason`, `guard/grad_health_only`, and `guard/healthy_signal_override`.
+
+## Config And Logs
+- Add config knobs:
+  - `HGI_ENABLED`
+  - `HGI_MODEL_TRUST_MIN`
+  - `HGI_CRITIC_HEALTH_MIN`
+  - `HGI_SHORT_HORIZON`
+  - `HGI_FULL_HORIZON`
+  - `HGI_SKIP_UNHEALTHY_IMAGINATION`
+  - `HGI_DET_STOCH_GAP_WARN`
+
+- Add logs:
+  - `hgi/model_trust`
+  - `hgi/critic_health`
+  - `hgi/imag_trust`
+  - `hgi/effective_horizon`
+  - `hgi/skipped_ratio`
+  - `hgi/skip_reason_model`
+  - `hgi/skip_reason_critic`
+  - `hgi/det_stoch_gap_health`
+
+## Test Plan
+- Unit/synthetic checks:
+  - high model trust + healthy critic gives full horizon;
+  - high model trust + flat critic skips or shortens imagination;
+  - low model trust + healthy critic skips imagination;
+  - `det=0.05`, `stoch=16.0` marks deterministic failure;
+  - low `grad_health_mean` alone does not force `lr_scale=0.1` when `dqda_norm` and `q_pi_std` are healthy.
+
+- Training ablations:
+  - current SPECTRE test as baseline;
+  - model-trust-only gating, similar to M2AC/MACURA;
+  - PAVE-lite only;
+  - health-gate only;
+  - full SPECTRE-HGI.
+
+- Success criteria:
+  - `return_test_det` tracks stochastic return instead of dying;
+  - `bridge/dqda_norm` sustains above `1e-4`;
+  - `bridge/q_pi_std` stays above `0.03`;
+  - guard is not permanently stuck at `lr_scale=0.1`;
+  - imagined updates are skipped when critic health collapses.
+
+## Assumptions
+- Do not change the world-model architecture yet.
+- Do not unfreeze actor encoder/context gradients in this pass.
+- Treat this as a research algorithm direction, not a guaranteed publication claim.
+- Current live run should continue as evidence; the next implementation should start a clean named run such as `SPECTRE_HGI_test_10`.
+
+## Checklist
+
+### [x] 1. Fix guard grad-health-only throttling
+
+Make `grad_health_low` alone a warning/override path when `dqda_norm`,
+`q_pi_std`, and critic action sensitivity are healthy. Reserve hard throttling
+for dQ/dA starvation/explosion, flat critic action signal, or severe gradient
+health collapse. Log `guard/throttle_reason`, `guard/grad_health_only`, and
+`guard/healthy_signal_override`.
+
+### [x] 2. Add HGI trust metrics
+
+Compute and log `hgi/model_trust`, `hgi/critic_health`, and `hgi/imag_trust`
+from world-model uncertainty and actor-critic health.
+
+### [x] 3. Gate imagination updates
+
+Use `imag_trust` to skip, shorten, or allow imagined actor/critic updates while
+leaving real replay critic learning active.
+
+### [x] 4. Add HGI config knobs and run naming
 
-- Helpers must be safe under `torch.no_grad()`.
-- They must tolerate `None` tensors/modules.
-- Tensor stats should include mean, std, abs mean, min, max.
-- For tensors with batch dimension and feature dimension, also log per-dimension std min/mean/max and dead-dimension ratio.
-- Gradient helpers should return `0.0` if no gradients exist.
-
-## Phase 2: World Model Training Diagnostics
-
-_Primary file: `tmrl/custom/custom_algorithms.py`_
-
-### [x] 2. Log replay inputs before each WM gradient pass
-
-Inside the dynamics/world-model training path, before the WM train step, log:
-
-```text
-wm_input/state_mean
-wm_input/state_std
-wm_input/state_abs_mean
-wm_input/next_state_mean
-wm_input/next_state_std
-wm_input/action_mean
-wm_input/action_std
-wm_input/reward_mean
-wm_input/reward_std
-wm_input/context_z_mean
-wm_input/context_z_std
-wm_input/context_z_dead_dim_ratio_1e3
-```
+Add the HGI config fields and prepare a clean `SPECTRE_HGI_test_10` run.
 
-Requirements:
+### [x] 5. Add HGI synthetic checks
 
-- Use the shared tensor-stat helper.
-- Only log `context_z` stats when `context_z` is present.
-- Do not detach tensors in a way that changes training behavior.
-
-### [x] 3. Log latent posterior, prior, KL, reconstruction, and reward metrics
-
-Inside `LatentWorldModel.train_step(...)`, extend the returned metrics with:
-
-```text
-wm/z_t_mean
-wm/z_t_std
-wm/z_t_abs_mean
-wm/z_t_dead_dim_ratio_1e3
-wm/z_t_dim_std_min
-wm/z_t_dim_std_mean
-wm/z_t_dim_std_max
-wm/prior_mu_mean
-wm/prior_mu_std
-wm/prior_logvar_mean
-wm/prior_logvar_std
-wm/post_mu_mean
-wm/post_mu_std
-wm/post_logvar_mean
-wm/post_logvar_std
-wm/kl_mean
-wm/kl_std
-wm/kl_min
-wm/kl_max
-wm/state_recon_loss
-wm/reward_loss
-wm/reward_pred_mean
-wm/reward_pred_std
-wm/reward_target_mean
-wm/reward_target_std
-wm/reward_error_abs_mean
-```
-
-Requirements:
-
-- Prefer existing loss tensors/variables where available.
-- Do not add extra forward passes for this checklist item.
-- Keep metric names stable and scalar.
+Cover trust gating, deterministic/stochastic failure detection, and guard
+override behavior.
 
-### [x] 4. Log WM gradient norms after backward and before optimizer step
+### [x] 6. Add conservative HGI post-warmup ramp
 
-In the WM training step, after `loss.backward()` and before optimizer stepping/clipping, log:
+After world-model warmup, cap healthy imagination to `HGI_SHORT_HORIZON` for
+the first `HGI_POST_WARMUP_SHORT_STEPS` WM train steps before allowing full
+`HGI_FULL_HORIZON`. Log ramp state and keep unhealthy/disabled gates skipping
+as before.
 
-```text
-wm_grad/encoder
-wm_grad/prior
-wm_grad/posterior
-wm_grad/decoder
-wm_grad/reward_head
-wm_grad/total
-```
-
-Requirements:
+### [x] 7. Add best evaluation checkpoint preservation
 
-- Match names to actual submodules in `LatentWorldModel`.
-- If a submodule does not exist under that exact role, skip it or map it to the closest actual module name.
-- Do not change clipping or optimizer behavior.
+Preserve a separate best-eval trainer checkpoint when deterministic evaluation
+sets a new high score above the configured threshold. Keep the normal scheduled
+checkpoint flow unchanged and log `best_checkpoint/*` round metrics.
 
-## Phase 3: Imagination Rollout Diagnostics
+### [x] 8. Scrub absolute position from critic and world model
 
-_Primary file: `tmrl/custom/custom_algorithms.py`_
+Remove `xyz` and absolute `progress` from privileged critic/RSSM state so the
+training signal cannot directly memorize track coordinates. Keep ego-local
+speed, gear, rpm, lidar, crash, progress gain, action history, images, and
+context features.
 
-### [x] 5. Log imagined rollout health by horizon
+### [x] 9. Document privileged-state leakage and fixes
 
-Inside `LatentWorldModel.imagine(...)` or the caller that receives imagined rollout tensors, log per horizon:
+Add a dedicated postmortem/design note explaining the map-aware teacher leak,
+the critic/RSSM scrub, best-eval checkpointing, HGI post-warmup ramp, warmup
+recommendation, required restart/reset protocol, and next-run watch metrics.
 
-```text
-wm_imag/h{h}_state_mean
-wm_imag/h{h}_state_std
-wm_imag/h{h}_state_abs_mean
-wm_imag/h{h}_action_mean
-wm_imag/h{h}_action_std
-wm_imag/h{h}_reward_mean
-wm_imag/h{h}_reward_std
-wm_imag/h{h}_uncertainty_mean
-wm_imag/h{h}_uncertainty_std
-```
+### [x] 10. Add actor churn regularization
 
-Requirements:
+Add a small EMA actor-head anchor that penalizes rapid deterministic pre-tanh
+policy drift on real replay actor updates. Keep the anchor configurable, log
+`loss_churn` and `churn/*`, and leave real replay, HGI, WM, and guard logic
+otherwise unchanged.
 
-- Log only tensors already produced by imagination.
-- If uncertainty is unavailable, skip uncertainty keys.
-- Keep the logging cheap enough to run every gradient pass.
+### [x] 11. Add critic CHAIN value-churn regularization
 
-## Phase 4: Bridge Diagnostics
+Add a slow EMA Q-head anchor that penalizes rapid critic output drift on replay
+states/actions. Keep TD learning, WM, HGI, actor/critic architectures, and guard
+thresholds unchanged. Log `loss_q_churn`, `loss_q_churn_weighted`, and
+`churn/q_*` so value churn is visible during runs.
 
-_Primary file: `tmrl/custom/custom_algorithms.py`_
+### [x] 12. Add health-gated entropy floor controller
 
-### [x] 6. Log real-vs-imagined state and action bridge statistics
+Replace fixed alpha-floor pressure with a per-action sidecar controller:
+consolidate by lowering forced entropy when actor churn is high and critic
+signal is healthy, but restore the baseline floor when dQ/dA, `q_pi_std`, Q
+drift, model trust, gradient health, or guard state indicates starving/unsafe
+actor-critic signal. Keep SAC temperature learning intact and log each
+`entropy_health/*` gate and floor.
 
-In `_imagined_critic_update(...)`, log:
+### [x] 13. Fix metrics logging schema
 
-```text
-bridge/state_real_mean
-bridge/state_real_std
-bridge/state_imag_mean
-bridge/state_imag_std
-bridge/state_distribution_gap
-bridge/action_real_mean
-bridge/action_real_std
-bridge/action_imag_mean
-bridge/action_imag_std
-bridge/act1_real_mean
-bridge/act2_real_mean
-bridge/act1_vs_imag_action_abs_diff
-bridge/act2_vs_act1_abs_diff
-```
+Replace the dynamic all-metrics CSV append path with two per-run files:
+`RUN_NAME.metrics.jsonl` for full-fidelity metrics and
+`RUN_NAME.stable.csv` for a fixed-width dashboard schema. Preserve dynamic
+diagnostics such as `wm_imag/h*` in JSONL only, keep missing dashboard values
+blank, and cover the 298/509/941-key schema expansion regression.
 
-Requirements:
+### [x] 14. Fix RSSM posterior-collapse pressure
 
-- `state_distribution_gap` should compare feature means between real and imagined states when shapes are compatible.
-- Action-history diagnostics should verify that critic history slots are not accidentally duplicated current actions.
-- Do not change imagined critic target construction.
+Align the world-model KL objective with Dreamer-style dynamics/representation
+balancing: train the prior toward a stopped posterior, apply a smaller
+posterior-to-stopped-prior representation loss, restore nonzero free nats in
+the live config, and add z-only latent-probe diagnostics so HGI can distinguish
+true latent usefulness from decoder reconstruction through the deterministic
+state path.
 
-### [x] 7. Log context bridge health
+### [x] 15. Tighten latent bypass detection
 
-Where `context_z` enters WM training, imagination, surprise, and critic-facing logic, log:
+Make HGI latent trust depend on the posterior beating zero/shuffled latent
+ablations, not just KL or a single favorable baseline. Add a small decoder
+latent-use loss so the actual RSSM decoder is pressured to reconstruct from
+posterior `z`, and log the stricter ablation margin metrics.
 
-```text
-bridge/context_z_mean
-bridge/context_z_std
-bridge/context_z_abs_mean
-bridge/context_z_dead_dim_ratio_1e3
-bridge/context_z_requires_grad
-bridge/context_z_to_wm_present
-bridge/context_z_to_critic_present
-```
+### [x] 16. Add portable critic false-oracle safety
 
-Requirements:
+Add scale-free actor safety gates for policy-Q overconfidence, relative actor
+churn spikes, and reward-energy liveness collapse. Feed the same health signals
+into HGI critic health, and switch WM KL trust to a free-nats band so alive
+latents are no longer scored as untrusted merely because raw KL is nonzero.
 
-- Presence flags should be `1.0` or `0.0`.
-- `requires_grad` should be logged as `1.0` or `0.0`.
-- Do not force gradients on or off.
+### [x] 17. Add deterministic skill-transfer feedback
 
-### [x] 8. Log critic value bridge metrics for real vs imagined batches
+### [x] 18. Fix entropy collapse feedback loops
 
-In critic update paths that have access to both real and imagined data, log:
+Gate stagnation override and recovery drive by log_std sign so they never
+boost exploration when the policy is already too noisy. Ungate log_std ceiling
+penalty from det_skill_drive so it always pushes log_std below the ceiling.
+Gate AWDB min_weight by positive mean Q advantage so the bridge only distills
+from stochastic samples the critic actually ranks as better on average, and log
+target vs applied AWDB minimum weight.
 
-```text
-bridge/q_real_mean
-bridge/q_real_std
-bridge/q_imag_mean
-bridge/q_imag_std
-bridge/q_imag_minus_real
-bridge/target_q_imag_mean
-bridge/target_q_imag_std
-bridge/imag_td_error_mean
-bridge/imag_td_error_abs_mean
-```
-
-Requirements:
-
-- Use existing Q predictions and targets when available.
-- Avoid adding expensive duplicate critic forward passes unless there is no existing value to log.
-- If real Q is not available in the imagined update function, log imagined-only values there and leave real-vs-imag comparison for the real critic update path.
-
-### [x] 9. Log actor-critic gradient bridge health
-
-In the actor update path, add a cheap probe for:
-
-```text
-bridge/dqda_norm
-bridge/dqda_abs_mean
-bridge/actor_action_requires_grad
-bridge/critic_input_requires_grad
-```
-
-Requirements:
-
-- The probe must not alter the actual actor loss or optimizer state.
-- Use `torch.autograd.grad` carefully and tolerate unavailable gradients.
-- Do not retain graphs longer than needed.
-
-## Phase 5: Trust / Uncertainty Diagnostics
-
-_Primary file: `tmrl/custom/custom_algorithms.py`_
-
-### [x] 10. Log verifier uncertainty and trust saturation
-
-Where verifier uncertainty or trust is computed, log:
-
-```text
-wm/verifier_uncertainty_mean
-wm/verifier_uncertainty_std
-wm/verifier_trust_mean
-wm/verifier_trust_std
-wm/verifier_trust_min
-wm/verifier_trust_max
-wm/verifier_trust_saturation_low
-wm/verifier_trust_saturation_high
-bridge/trust_mean
-bridge/trust_saturation_low
-bridge/trust_saturation_high
-```
-
-Requirements:
-
-- Saturation low is the fraction of trust values below `0.05`.
-- Saturation high is the fraction of trust values above `0.95`.
-- Do not change trust computation in this task.
-
-## Phase 6: Verification
-
-### [x] 11. Run a syntax/import check
-
-Run the lightest practical check available for the edited files, such as:
-
-```powershell
-python -m py_compile tmrl/custom/custom_algorithms.py
-```
-
-If project imports require unavailable runtime dependencies, document the blocker in the final response.
-
-### [x] 12. Handoff for review
-
-When all checklist items are complete:
-
-- Change the top of this file to `STATUS: REVIEW`.
-- Stop and report the implemented logging groups and verification result.
+Latch the signed deterministic/stochastic eval gap back into the trainer so the
+next actor updates know when stochastic samples are carrying skill that the
+deterministic mean has not absorbed. Use that signal to raise AWDB distillation,
+increase the minimum deterministic bridge weight, apply a soft log-std ceiling
+penalty only during stochastic-advantage regimes, and expose dashboard metrics
+for the controller.

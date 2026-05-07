@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from tmrl.custom.custom_models import (
+    EGO_WM_STATE_DIM,
     RSSMEncoder,
     RSSMPrior,
     RSSMPosterior,
@@ -29,7 +30,7 @@ from tmrl.custom.custom_models import (
 
 
 BATCH = 8
-STATE_DIM = 28
+STATE_DIM = EGO_WM_STATE_DIM
 ACTION_DIM = 3
 LATENT_DIM = 32
 GRU_DIM = 128
@@ -126,6 +127,15 @@ class TestLatentWorldModel(unittest.TestCase):
         self.assertIn("wm_recon_state", metrics)
         self.assertIn("wm_recon_reward", metrics)
         self.assertIn("wm_kl", metrics)
+        self.assertIn("wm_dyn_loss", metrics)
+        self.assertIn("wm_rep_loss", metrics)
+        self.assertIn("wm_latent_probe_loss", metrics)
+        self.assertIn("wm_decoder_latent_use_loss", metrics)
+        self.assertIn("wm/post_prior_mu_abs_diff", metrics)
+        self.assertIn("wm_val/recon_zero_z", metrics)
+        self.assertIn("wm_val/recon_shuffle_z", metrics)
+        self.assertIn("wm_val/post_advantage_z_ablate_min", metrics)
+        self.assertIn("wm_val/post_advantage_ratio", metrics)
         self.assertIn("wm_total_loss", metrics)
 
     def test_train_step_gradients(self):

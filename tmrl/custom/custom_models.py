@@ -1214,6 +1214,8 @@ CONTEXT_WINDOW_SIZE = 16  # K: number of recent transitions for context
 CONTEXT_INPUT_DIM = 24    # speed(1) + lidar(19) + action(3) + reward(1)
 CONTEXT_Z_DIM = 64        # latent context dimension (widened for richer context)
 FUSED_DIM = 128           # output dimension of fusion gate (widened for capacity)
+EGO_WM_STATE_DIM = 24     # speed + gear + rpm + lidar(19) + crash + progress_gain
+EGO_CRITIC_FLOAT_DIM = EGO_WM_STATE_DIM + 6  # ego state + two previous 3-dim actions
 FILM_HIDDEN = 256         # hidden dimension for FiLM-modulated actor/critic MLPs
 FILM_N_LAYERS = 2         # number of FiLM-modulated layers
 
@@ -1289,7 +1291,7 @@ class ContextEncoder(nn.Module):
 
         # === 3. Stabilized Projections (Spectral Norm) ===
         from torch.nn.utils import spectral_norm
-        self.state_dim = 40 + img_feat_dim  # 40 (telemetry+deltas) + 64 (img) = 104
+        self.state_dim = 42 + img_feat_dim  # 42 (telemetry/reward+deltas) + 64 (img) = 106
         self.action_dim = 6  # 3 (act) + 3 (deltas)
         self.state_proj = spectral_norm(nn.Linear(self.state_dim, self.d_model))
         self.action_proj = spectral_norm(nn.Linear(self.action_dim, self.d_model))
@@ -1344,13 +1346,25 @@ class ContextEncoder(nn.Module):
 
     def forward(self, context_seq, img_context=None, fused_obs=None):
         B, K, _ = context_seq.shape
+        if context_seq.shape[-1] < self.input_dim:
+            context_seq = F.pad(context_seq, (0, self.input_dim - context_seq.shape[-1]))
+        elif context_seq.shape[-1] > self.input_dim:
+            context_seq = context_seq[:, :, :self.input_dim]
         enriched = self._compute_deltas(context_seq)
         
         # Split Features
-        # Telemetry: speed+lidar (0:20), actions (20:23)
-        # enriched has length 46 (input_dim=23 -> raw+deltas)
-        state_telemetry = torch.cat([enriched[:, :, :20], enriched[:, :, 23:43]], dim=-1)
-        action_feats = torch.cat([enriched[:, :, 20:23], enriched[:, :, 43:46]], dim=-1)
+        # Context: speed+lidar (0:20), actions (20:23), reward (23)
+        # enriched has length 48: raw 24 dims followed by 24 deltas.
+        state_telemetry = torch.cat(
+            [
+                enriched[:, :, :20],
+                enriched[:, :, 23:24],
+                enriched[:, :, 24:44],
+                enriched[:, :, 47:48],
+            ],
+            dim=-1,
+        )
+        action_feats = torch.cat([enriched[:, :, 20:23], enriched[:, :, 44:47]], dim=-1)
         
         # Image Context Features
         if img_context is not None:
@@ -1625,7 +1639,14 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
             speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2 = obs
             
         # action = last action (act1 is the most recent in act_buf)
-        ctx = torch.cat((speed, lidar, act1), dim=-1)  # (B, 23)
+        B = speed.shape[0]
+        reward = torch.full(
+            (B, 1),
+            float(self._online_prev_reward),
+            device=speed.device,
+            dtype=speed.dtype,
+        )
+        ctx = torch.cat((speed.view(B, -1), lidar.view(B, -1), act1.view(B, -1), reward), dim=-1)  # (B, 24)
         # In online mode, images has shape (B, 4, 64, 64). We take the latest frame.
         img_ctx = images[:, -1:, :, :]  # (B, 1, 64, 64)
         return ctx, img_ctx
@@ -1733,10 +1754,10 @@ class ContextualDroQHybridActorCritic(nn.Module):
         # Shared context encoder (used during training to provide z to the Critic)
         self.context_encoder = self.actor.context_encoder
 
-        # 2 Q-heads with DroQ dropout
-        # Critic is asymmetric: skips FusionGate, takes 34-dim numeric float vector + z
+        # 2 Q-heads with DroQ dropout.
+        # Critic is asymmetric, but limited to ego-local numeric floats + z.
         self.qs = ModuleList([
-            DroQQHead(action_space, feature_dim=34 + CONTEXT_Z_DIM, dropout_rate=dropout_rate)
+            DroQQHead(action_space, feature_dim=EGO_CRITIC_FLOAT_DIM + CONTEXT_Z_DIM, dropout_rate=dropout_rate)
             for _ in range(2)
         ])
 
@@ -1746,11 +1767,11 @@ class ContextualDroQHybridActorCritic(nn.Module):
         
         Args:
             obs: tuple of (speed, gear, rpm, images, lidar, xyz, progress, crash, progress_gain, act1, act2)
-            context: (B, K, 23) tensor of recent transitions, or None
+            context: (B, K, 24) tensor of recent transitions, or None
             img_context: (B, K, 1, 64, 64) tensor of recent images, or None
         Returns:
             fused: (B, FUSED_DIM) fused sensor features for the Actor
-            critic_floats: (B, 34) float features for the Critic
+            critic_floats: (B, 30) ego-local float features for the Critic
             film_params: list of (γ, β) tuples for FiLM modulation
         """
         if len(obs) == 9:
@@ -1767,8 +1788,6 @@ class ContextualDroQHybridActorCritic(nn.Module):
         gear = gear.view(B, -1)
         rpm = rpm.view(B, -1)
         lidar = lidar.view(B, -1)
-        xyz = xyz.view(B, -1)
-        progress = progress.view(B, -1)
         crash = crash.view(B, -1)
         progress_gain = progress_gain.view(B, -1)
         act1 = act1.view(B, -1)
@@ -1781,9 +1800,9 @@ class ContextualDroQHybridActorCritic(nn.Module):
         # Fusion Gate for Actor
         fused = self._actor_fusion_gate(img_embed, float_embed)  # (B, 128)
 
-        # Critic sees EVERYTHING except pixels (Asymmetric SAC)
-        # Added crash (1) and progress_gain (1) to critic features
-        critic_floats = torch.cat((speed, gear, rpm, lidar, xyz, progress, crash, progress_gain, act1, act2), dim=-1)
+        # Critic gets ego-local/sensor features only. Absolute xyz/progress are
+        # intentionally excluded to prevent track-position memorization.
+        critic_floats = torch.cat((speed, gear, rpm, lidar, crash, progress_gain, act1, act2), dim=-1)
 
         # Context → latent belief `z`
         if context is not None:
@@ -1792,7 +1811,7 @@ class ContextualDroQHybridActorCritic(nn.Module):
             z = torch.zeros(fused.shape[0], CONTEXT_Z_DIM, device=fused.device)
 
         # Asymmetric Critic concatenated belief
-        critic_features = torch.cat([critic_floats, z], dim=-1) # (B, 32 + 64)
+        critic_features = torch.cat([critic_floats, z], dim=-1)
 
         # Removed FiLM params generation
         # film_params = self.film_generator(z)
@@ -2228,14 +2247,14 @@ class ImaginationActor(nn.Module):
     """
     Lightweight MLP policy for imagination rollouts.
 
-    Maps critic-state (28-dim: speed/gear/rpm/lidar/xyz/progress/crash/progress_gain)
+    Maps ego-local critic-state (24-dim: speed/gear/rpm/lidar/crash/progress_gain)
     to actions (3-dim: steer/gas/brake) with tanh output.
 
     Trained to mimic the real actor's behavior from (critic_state, action) pairs
     collected during regular training. Used in _imagined_critic_update so that
     imagined rollouts follow realistic trajectories instead of random actions.
     """
-    def __init__(self, state_dim=28, action_dim=3, hidden_dim=128):
+    def __init__(self, state_dim=EGO_WM_STATE_DIM, action_dim=3, hidden_dim=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
@@ -2325,19 +2344,62 @@ class LatentWorldModel(nn.Module):
     """
     def __init__(self, state_dim=26, action_dim=3, latent_dim=32,
                  gru_dim=128, hidden_dim=256, kl_free_nats=1.0, num_reward_heads=5,
-                 context_z_dim=64):
+                 context_z_dim=64, dyn_loss_scale=1.0, rep_loss_scale=0.1,
+                 latent_probe_scale=0.1, anti_collapse_scale=0.1,
+                 decoder_latent_use_scale=0.1, decoder_latent_margin_ratio=0.05):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.latent_dim = latent_dim
         self.gru_dim = gru_dim
+        self.hidden_dim = hidden_dim
         self.kl_free_nats = kl_free_nats
         self.context_z_dim = context_z_dim
+        self.dyn_loss_scale = dyn_loss_scale
+        self.rep_loss_scale = rep_loss_scale
+        self.latent_probe_scale = latent_probe_scale
+        self.anti_collapse_scale = anti_collapse_scale
+        self.decoder_latent_use_scale = decoder_latent_use_scale
+        self.decoder_latent_margin_ratio = decoder_latent_margin_ratio
 
         self.encoder = RSSMEncoder(state_dim, latent_dim, hidden_dim)
         self.prior = RSSMPrior(latent_dim, action_dim, gru_dim, hidden_dim, context_z_dim)
         self.posterior = RSSMPosterior(gru_dim, state_dim, latent_dim, hidden_dim)
         self.decoder = RSSMDecoder(latent_dim, gru_dim, state_dim, hidden_dim, num_reward_heads)
+        self.latent_probe = self._make_latent_probe(latent_dim, hidden_dim, state_dim)
+
+    @staticmethod
+    def _make_latent_probe(latent_dim, hidden_dim, state_dim):
+        return nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, state_dim),
+        )
+
+    def ensure_latent_probe(self):
+        """Backfill the z-only probe for older pickled checkpoints."""
+        if not hasattr(self, "hidden_dim"):
+            self.hidden_dim = 256
+        if not hasattr(self, "dyn_loss_scale"):
+            self.dyn_loss_scale = 1.0
+        if not hasattr(self, "rep_loss_scale"):
+            self.rep_loss_scale = 0.1
+        if not hasattr(self, "latent_probe_scale"):
+            self.latent_probe_scale = 0.1
+        if not hasattr(self, "anti_collapse_scale"):
+            self.anti_collapse_scale = 0.1
+        if not hasattr(self, "decoder_latent_use_scale"):
+            self.decoder_latent_use_scale = 0.1
+        if not hasattr(self, "decoder_latent_margin_ratio"):
+            self.decoder_latent_margin_ratio = 0.05
+        if not hasattr(self, "latent_probe") or self.latent_probe is None:
+            device = next(self.parameters()).device
+            self.latent_probe = self._make_latent_probe(
+                self.latent_dim,
+                int(getattr(self, "hidden_dim", 256)),
+                self.state_dim,
+            ).to(device)
 
     def train_step(self, state, action, next_state, reward, context_z=None):
         """
@@ -2353,6 +2415,7 @@ class LatentWorldModel(nn.Module):
             metrics: dict with component losses for logging
         """
         self.train()
+        self.ensure_latent_probe()
         B = state.shape[0]
 
         # 1. Encode current state
@@ -2380,34 +2443,100 @@ class LatentWorldModel(nn.Module):
         mask_expanded = bootstrap_masks.unsqueeze(-1).float()  # (num_heads, B, 1)
         recon_reward = (reward_errors * mask_expanded).sum() / mask_expanded.sum().clamp(min=1.0)
 
+        # Force the stochastic posterior to carry observation information instead
+        # of letting the decoder reconstruct through h_next alone.
+        latent_probe_hat = self.latent_probe(z_post)
+        latent_probe_loss = F.mse_loss(latent_probe_hat, next_state)
         loss_recon = recon_state + recon_reward
 
-        # KL divergence: KL(posterior || prior), with free nats
-        var_post = log_var_post.exp()
-        var_prior = log_var_prior.exp()
-        kl_per_dim = 0.5 * (
-            log_var_prior - log_var_post
-            + var_post / var_prior
-            + (mu_post - mu_prior).pow(2) / var_prior
-            - 1.0
+        # Make the actual decoder depend on the posterior latent, not just the
+        # deterministic h_next bypass. We only backprop through the posterior
+        # reconstruction term here, so the loss cannot "win" by making zero or
+        # shuffled latents worse on purpose.
+        shuffle_idx = torch.randperm(B, device=state.device)
+        state_hat_zero_for_loss, _ = self.decoder(torch.zeros_like(z_post), h_next)
+        state_hat_shuffle_for_loss, _ = self.decoder(z_post[shuffle_idx].detach(), h_next)
+        recon_zero_for_loss = F.mse_loss(state_hat_zero_for_loss, next_state).detach()
+        recon_shuffle_for_loss = F.mse_loss(state_hat_shuffle_for_loss, next_state).detach()
+        decoder_margin_target = recon_state * (1.0 + float(self.decoder_latent_margin_ratio))
+        decoder_latent_use_loss = 0.5 * (
+            torch.relu(decoder_margin_target - recon_zero_for_loss)
+            + torch.relu(decoder_margin_target - recon_shuffle_for_loss)
         )
+
+        # Dreamer-style KL balancing:
+        # dyn trains the prior toward a stopped posterior, while rep applies a
+        # smaller representation pressure from posterior toward a stopped prior.
+        kl_per_dim = self._gaussian_kl_per_dim(mu_post, log_var_post, mu_prior, log_var_prior)
         kl_per_sample = kl_per_dim.sum(dim=-1)
         kl = kl_per_sample.mean()
-        kl_clamped = torch.clamp(kl, min=self.kl_free_nats)
+        dyn_kl_per_sample = self._gaussian_kl_per_sample(
+            mu_post.detach(), log_var_post.detach(), mu_prior, log_var_prior
+        )
+        rep_kl_per_sample = self._gaussian_kl_per_sample(
+            mu_post, log_var_post, mu_prior.detach(), log_var_prior.detach()
+        )
+        dyn_loss = self._free_nats_loss(dyn_kl_per_sample)
+        rep_loss = self._free_nats_loss(rep_kl_per_sample)
+        kl_loss = self.dyn_loss_scale * dyn_loss + self.rep_loss_scale * rep_loss
 
-        loss = loss_recon + kl_clamped
+        # Anti-collapse: mild reverse penalty when KL drops dangerously low.
+        # Gently pushes the posterior to stay informative (distinct from the prior).
+        kl_min_target = 0.05
+        kl_anti_collapse = self.anti_collapse_scale * torch.relu(kl_min_target - kl)
+
+        loss = (
+            loss_recon
+            + kl_loss
+            + self.latent_probe_scale * latent_probe_loss
+            + self.decoder_latent_use_scale * decoder_latent_use_loss
+            + kl_anti_collapse
+        )
 
         metrics = {
             "wm_recon_state": recon_state.item(),
             "wm_recon_reward": recon_reward.item(),
             "wm_kl": kl.item(),
-            "wm_kl_clamped": kl_clamped.item(),
+            "wm_kl_clamped": self._free_nats_loss(kl_per_sample).item(),
+            "wm_kl_loss": kl_loss.item(),
+            "wm_dyn_loss": dyn_loss.item(),
+            "wm_rep_loss": rep_loss.item(),
+            "wm_dyn_loss_weighted": (self.dyn_loss_scale * dyn_loss).item(),
+            "wm_rep_loss_weighted": (self.rep_loss_scale * rep_loss).item(),
+            "wm_dyn_loss_scale": float(self.dyn_loss_scale),
+            "wm_rep_loss_scale": float(self.rep_loss_scale),
+            "wm_kl_anti_collapse": kl_anti_collapse.item(),
+            "wm_latent_probe_loss": latent_probe_loss.item(),
+            "wm_latent_probe_loss_weighted": (self.latent_probe_scale * latent_probe_loss).item(),
+            "wm_latent_probe_scale": float(self.latent_probe_scale),
+            "wm_decoder_latent_use_loss": decoder_latent_use_loss.item(),
+            "wm_decoder_latent_use_loss_weighted": (
+                self.decoder_latent_use_scale * decoder_latent_use_loss
+            ).item(),
+            "wm_decoder_latent_use_scale": float(self.decoder_latent_use_scale),
+            "wm_decoder_latent_margin_ratio": float(self.decoder_latent_margin_ratio),
             "wm_total_loss": loss.item(),
         }
 
         with torch.no_grad():
             z_dim_std = z_t.detach().std(dim=0, unbiased=False)
             reward_error = reward_hats.detach() - reward_target.detach()
+            # Phase 2 diagnostic: imagination-quality probe.
+            # Training recon (recon_state) decodes from z_post, conditioned on the actual
+            # next observation. Imagination uses mu_prior (no obs grounding). The gap
+            # reveals how unreliable imagination is relative to training-time WM error.
+            state_hat_prior, _ = self.decoder(mu_prior, h_next)
+            state_hat_zero, _ = self.decoder(torch.zeros_like(mu_prior), h_next)
+            state_hat_shuffle, _ = self.decoder(z_post[shuffle_idx], h_next)
+            recon_state_prior = F.mse_loss(state_hat_prior, next_state).item()
+            recon_state_zero = F.mse_loss(state_hat_zero, next_state).item()
+            recon_state_shuffle = F.mse_loss(state_hat_shuffle, next_state).item()
+            recon_state_post = recon_state.detach().item()
+            post_adv_prior = recon_state_prior - recon_state_post
+            post_adv_zero = recon_state_zero - recon_state_post
+            post_adv_shuffle = recon_state_shuffle - recon_state_post
+            latent_advantage_best = max(post_adv_prior, post_adv_zero, post_adv_shuffle)
+            latent_advantage_z_ablate = min(post_adv_zero, post_adv_shuffle)
             metrics.update({
                 "wm/z_t_mean": z_t.detach().mean().item(),
                 "wm/z_t_std": z_t.detach().std(unbiased=False).item(),
@@ -2424,11 +2553,25 @@ class LatentWorldModel(nn.Module):
                 "wm/post_mu_std": mu_post.detach().std(unbiased=False).item(),
                 "wm/post_logvar_mean": log_var_post.detach().mean().item(),
                 "wm/post_logvar_std": log_var_post.detach().std(unbiased=False).item(),
+                "wm/post_prior_mu_abs_diff": (mu_post.detach() - mu_prior.detach()).abs().mean().item(),
+                "wm/post_prior_logvar_abs_diff": (log_var_post.detach() - log_var_prior.detach()).abs().mean().item(),
                 "wm/kl_mean": kl_per_sample.detach().mean().item(),
                 "wm/kl_std": kl_per_sample.detach().std(unbiased=False).item(),
                 "wm/kl_min": kl_per_sample.detach().min().item(),
                 "wm/kl_max": kl_per_sample.detach().max().item(),
-                "wm/state_recon_loss": recon_state.detach().item(),
+                "wm/state_recon_loss": recon_state_post,
+                "wm_val/recon_post": recon_state_post,
+                "wm_val/recon_prior": recon_state_prior,
+                "wm_val/recon_zero_z": recon_state_zero,
+                "wm_val/recon_shuffle_z": recon_state_shuffle,
+                "wm_val/recon_prior_post_ratio": recon_state_prior / max(recon_state_post, 1e-12),
+                "wm_val/post_advantage_over_prior": post_adv_prior,
+                "wm_val/post_advantage_over_zero": post_adv_zero,
+                "wm_val/post_advantage_over_shuffle": post_adv_shuffle,
+                "wm_val/post_advantage_best": latent_advantage_best,
+                "wm_val/post_advantage_z_ablate_min": latent_advantage_z_ablate,
+                "wm_val/post_advantage_ratio": latent_advantage_z_ablate / max(recon_state_post, 1e-12),
+                "wm/latent_probe_recon": F.mse_loss(self.latent_probe(mu_post), next_state).item(),
                 "wm/reward_loss": recon_reward.detach().item(),
                 "wm/reward_pred_mean": reward_hats.detach().mean().item(),
                 "wm/reward_pred_std": reward_hats.detach().std(unbiased=False).item(),
@@ -2439,20 +2582,37 @@ class LatentWorldModel(nn.Module):
         return loss, metrics
 
     @staticmethod
-    def _kl_divergence(mu_post, log_var_post, mu_prior, log_var_prior):
-        """
-        KL(N(mu_post, var_post) || N(mu_prior, var_prior))
-        Averaged over batch and latent dims.
-        """
+    def _gaussian_kl_per_dim(mu_post, log_var_post, mu_prior, log_var_prior):
         var_post = log_var_post.exp()
         var_prior = log_var_prior.exp()
-        kl = 0.5 * (
+        return 0.5 * (
             log_var_prior - log_var_post
             + var_post / var_prior
             + (mu_post - mu_prior).pow(2) / var_prior
             - 1.0
         )
-        return kl.sum(dim=-1).mean()  # sum over latent, mean over batch
+
+    @staticmethod
+    def _gaussian_kl_per_sample(mu_post, log_var_post, mu_prior, log_var_prior):
+        return LatentWorldModel._gaussian_kl_per_dim(
+            mu_post, log_var_post, mu_prior, log_var_prior
+        ).sum(dim=-1)
+
+    def _free_nats_loss(self, kl_per_sample):
+        if self.kl_free_nats > 0.0:
+            free_nats = torch.full_like(kl_per_sample, float(self.kl_free_nats))
+            kl_per_sample = torch.maximum(kl_per_sample, free_nats)
+        return kl_per_sample.mean()
+
+    @staticmethod
+    def _kl_divergence(mu_post, log_var_post, mu_prior, log_var_prior):
+        """
+        KL(N(mu_post, var_post) || N(mu_prior, var_prior))
+        Averaged over batch and latent dims.
+        """
+        return LatentWorldModel._gaussian_kl_per_sample(
+            mu_post, log_var_post, mu_prior, log_var_prior
+        ).mean()
 
     @torch.no_grad()
     def imagine(self, state, policy_fn, horizon, gamma=0.99, context_z=None):

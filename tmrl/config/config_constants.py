@@ -28,7 +28,7 @@ WEIGHTS_FOLDER = TMRL_FOLDER / "weights"
 CONFIG_FOLDER = TMRL_FOLDER / "config"
 
 CONFIG_FILE = TMRL_FOLDER / "config" / "config.json"
-with open(CONFIG_FILE) as f:
+with open(CONFIG_FILE, encoding="utf-8-sig") as f:
     TMRL_CONFIG = json.load(f)
 
 # VERSION CHECK: =====================================================

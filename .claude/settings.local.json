@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scratch.py)",
+      "Bash(python -c ' *)",
+      "Bash(python plot_hgefc1.py)"
+    ]
+  }
+}

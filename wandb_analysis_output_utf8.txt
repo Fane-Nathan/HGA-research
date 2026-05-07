@@ -1,0 +1,386 @@
+﻿Total runs: 93
+
+====================================================================================================
+GENERATIONAL ANALYSIS OF SPECTRE DEVELOPMENT
+====================================================================================================
+
+================================================================================
+  Phase 0: Early Baselines (pre-SPECTRE) (3 runs)
+================================================================================
+  Period: 2026-02-12 to 2026-02-12
+  Total compute: 0.0 hrs | Avg: 0.0 hrs | Max: 0.0 hrs
+  Outcomes: {'finished': 3}
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  faithful-river-1                       finished      0.0          -        -
+  dainty-snowflake-5                     finished      0.0          -        -
+  azure-morning-9                        finished      0.0          -        -
+
+================================================================================
+  Phase 1: HP Sweeps & Stability (16 runs)
+================================================================================
+  Period: 2026-02-12 to 2026-02-17
+  Total compute: 123.3 hrs | Avg: 7.7 hrs | Max: 64.0 hrs
+  Outcomes: {'finished': 6, 'crashed': 3, 'killed': 7}
+  Entropy coefs (final):
+    hpsweep_trial_5                        α=0.0160 ⚡ LOW
+    hpsweep_trial_7                        α=0.0160 ⚡ LOW
+    hpsweep_trial_9                        α=0.0160 ⚡ LOW
+    Test_stability_run_4                   α=0.0500 ✅
+    Test_Stagnation_run_1                  α=0.1110 ✅
+    Test_Stagnation_run_3                  α=0.0200 ⚡ LOW
+    Test_Stagnation_run_4                  α=0.0200 ⚡ LOW
+    One of the Succesfull run              α=0.0200 ⚡ LOW
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  hpsweep_trial_5                        finished      3.4     0.0160        -
+  trial/5/genial-sponge-3                finished      0.0          -        -
+  hpsweep_trial_6                        crashed       0.5          -        -
+  hpsweep_trial_7                        finished      7.9     0.0160        -
+  trial/7/classic-sky-7                  finished      0.0          -        -
+  hpsweep_trial_8                        crashed       0.1          -        -
+  hpsweep_trial_9                        finished      8.5     0.0160        -
+  trial/9/whole-darkness-11              finished      0.0          -        -
+  hpsweep_trial_10                       crashed       6.4          -        -
+  Test_stability_run_3                   killed        1.5          -        -
+  Test_stability_run_4                   killed        7.0     0.0500        -
+  Test_Stagnation_run_1                  killed        9.3     0.1110        -
+  Test_Stagnation_run_2                  killed        0.7          -        -
+  Test_Stagnation_run_3                  killed        6.0     0.0200        -
+  Test_Stagnation_run_4                  killed        8.0     0.0200        -
+  One of the Succesfull run              killed       64.0     0.0200        -
+
+================================================================================
+  Phase 2: DroQ Variants (6 runs)
+================================================================================
+  Period: 2026-02-20 to 2026-03-01
+  Total compute: 212.1 hrs | Avg: 35.4 hrs | Max: 174.5 hrs
+  Outcomes: {'killed': 5, 'failed': 1}
+  Entropy coefs (final):
+    DroQ_v0.6_Asymritic_UTD20_AMP          α=0.1023 ✅
+    DroQ_v0.7_Collapse_Test                α=0.1730 ✅
+    DroQ_v0.8_Collapse_Test                α=0.1728 ✅
+    DroQ_v0.9_AsymSAC_PER                  α=0.1863 ✅
+    DroQ_v0.9_AsymSAC_PER_test_2           α=0.0200 ⚡ LOW
+    DroQ_v0.9_AsymSAC_PER_test_3           α=0.0982 ✅
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  DroQ_v0.6_Asymritic_UTD20_AMP          killed      174.5     0.1023        -
+  DroQ_v0.7_Collapse_Test                killed        8.6     0.1730        -
+  DroQ_v0.8_Collapse_Test                killed        5.3     0.1728        -
+  DroQ_v0.9_AsymSAC_PER                  killed        5.1     0.1863        -
+  DroQ_v0.9_AsymSAC_PER_test_2           failed       15.1     0.0200        -
+  DroQ_v0.9_AsymSAC_PER_test_3           killed        3.6     0.0982        -
+
+================================================================================
+  Phase 3: SPECTRE v0-v6 (Initial Architecture) (7 runs)
+================================================================================
+  Period: 2026-03-01 to 2026-03-10
+  Total compute: 215.7 hrs | Avg: 30.8 hrs | Max: 72.5 hrs
+  Outcomes: {'killed': 7}
+  Entropy coefs (final):
+    SPECTRE                                α=0.0219 ⚡ LOW
+    SPECTRE_v1                             α=0.0033 ⚠️ CRASH
+    SPECTRE_v2                             α=0.0031 ⚠️ CRASH
+    SPECTRE_v3                             α=0.0100 ⚡ LOW
+    SPECTRE_v4                             α=0.0142 ⚡ LOW
+    SPECTRE_v5                             α=0.0116 ⚡ LOW
+    SPECTRE_v6                             α=0.0500 ✅
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  SPECTRE                                killed       72.5     0.0219        -
+  SPECTRE_v1                             killed       12.2     0.0033        -
+  SPECTRE_v2                             killed       31.2     0.0031        -
+  SPECTRE_v3                             killed       38.9     0.0100        -
+  SPECTRE_v4                             killed       10.3     0.0142        -
+  SPECTRE_v5                             killed       38.4     0.0116        -
+  SPECTRE_v6                             killed       12.2     0.0500        -
+
+================================================================================
+  Phase 4: SPECTRE v7-v16 (World Model Integration) (11 runs)
+================================================================================
+  Period: 2026-03-10 to 2026-03-22
+  Total compute: 334.0 hrs | Avg: 30.4 hrs | Max: 172.0 hrs
+  Outcomes: {'killed': 9, 'failed': 1, 'crashed': 1}
+  Entropy coefs (final):
+    SPECTRE_v7                             α=0.0500 ✅
+    SPECTRE_v8                             α=0.1001 ✅
+    SPECTRE_v9                             α=0.0571 ✅
+    SPECTRE_v10                            α=0.3272 ✅
+    SPECTRE_v10.5                          α=0.2333 ✅
+    SPECTRE_v11                            α=0.5745 ✅
+    SPECTRE_v12                            α=0.2333 ✅
+    SPECTRE_v13                            α=0.2333 ✅
+    SPECTRE_v14                            α=0.1493 ✅
+    SPECTRE_v15                            α=0.1735 ✅
+    SPECTRE_v16                            α=0.0747 ✅
+  World model KL (final):
+    SPECTRE_v7                             KL=0.6321 ✅
+    SPECTRE_v8                             KL=0.5304 ✅
+    SPECTRE_v9                             KL=0.8857 ✅
+    SPECTRE_v10                            KL=0.9185 ✅
+    SPECTRE_v10.5                          KL=0.6481 ✅
+    SPECTRE_v11                            KL=0.6439 ✅
+    SPECTRE_v12                            KL=0.6590 ✅
+    SPECTRE_v13                            KL=0.7642 ✅
+    SPECTRE_v14                            KL=0.9060 ✅
+    SPECTRE_v15                            KL=0.8551 ✅
+    SPECTRE_v16                            KL=0.7066 ✅
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  SPECTRE_v7                             killed       10.9     0.0500   0.6321
+  SPECTRE_v8                             killed       22.3     0.1001   0.5304
+  SPECTRE_v9                             failed       28.2     0.0571   0.8857
+  SPECTRE_v10                            killed       17.0     0.3272   0.9185
+  SPECTRE_v10.5                          killed        1.6     0.2333   0.6481
+  SPECTRE_v11                            killed        7.8     0.5745   0.6439
+  SPECTRE_v12                            crashed      27.7     0.2333   0.6590
+  SPECTRE_v13                            killed      172.0     0.2333   0.7642
+  SPECTRE_v14                            killed        4.3     0.1493   0.9060
+  SPECTRE_v15                            killed        5.0     0.1735   0.8551
+  SPECTRE_v16                            killed       37.1     0.0747   0.7066
+
+================================================================================
+  Phase 5: SPECTRE v17-v25 (Tuning & Debugging) (9 runs)
+================================================================================
+  Period: 2026-03-24 to 2026-03-26
+  Total compute: 61.5 hrs | Avg: 6.8 hrs | Max: 21.2 hrs
+  Outcomes: {'killed': 9}
+  Entropy coefs (final):
+    SPECTRE_v19                            α=0.0435 ✅
+    SPECTRE_v20                            α=0.0705 ✅
+    SPECTRE_v21                            α=0.0952 ✅
+    SPECTRE_v22                            α=0.1735 ✅
+    SPECTRE_v23                            α=0.1495 ✅
+    SPECTRE_v24                            α=0.1493 ✅
+  World model KL (final):
+    SPECTRE_v19                            KL=0.6816 ✅
+    SPECTRE_v20                            KL=0.7530 ✅
+    SPECTRE_v21                            KL=0.7122 ✅
+    SPECTRE_v22                            KL=0.6919 ✅
+    SPECTRE_v23                            KL=0.7779 ✅
+    SPECTRE_v24                            KL=0.8138 ✅
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  SPECTRE_v17                            killed        1.0          -        -
+  SPECTRE_v18                            killed        0.1          -        -
+  SPECTRE_v19                            killed       21.2     0.0435   0.6816
+  SPECTRE_v20                            killed       14.8     0.0705   0.7530
+  SPECTRE_v21                            killed       11.4     0.0952   0.7122
+  SPECTRE_v22                            killed        1.9     0.1735   0.6919
+  SPECTRE_v23                            killed        7.5     0.1495   0.7779
+  SPECTRE_v24                            killed        2.8     0.1493   0.8138
+  SPECTRE_v25                            killed        0.7          -        -
+
+================================================================================
+  Phase 6: SPECTRE v26-v37 (PEARL+RSSM Full Pipeline) (11 runs)
+================================================================================
+  Period: 2026-04-09 to 2026-04-13
+  Total compute: 107.0 hrs | Avg: 9.7 hrs | Max: 28.6 hrs
+  Outcomes: {'killed': 10, 'crashed': 1}
+  Entropy coefs (final):
+    SPECTRE_v26                            α=0.0557 ✅
+    SPECTRE_v28                            α=0.0093 ⚡ LOW
+    SPECTRE_v30                            α=0.0095 ⚡ LOW
+    SPECTRE_v31                            α=0.0159 ⚡ LOW
+    SPECTRE_v32                            α=0.0074 ⚡ LOW
+    SPECTRE_v34                            α=0.0089 ⚡ LOW
+    SPECTRE_v35                            α=0.0072 ⚡ LOW
+    SPECTRE_v36                            α=0.0695 ✅
+    SPECTRE_v37                            α=0.0038 ⚠️ CRASH
+  World model KL (final):
+    SPECTRE_v26                            KL=0.8138 ✅
+    SPECTRE_v28                            KL=0.6025 ✅
+    SPECTRE_v30                            KL=0.7301 ✅
+    SPECTRE_v31                            KL=0.6699 ✅
+    SPECTRE_v32                            KL=0.7612 ✅
+    SPECTRE_v34                            KL=0.6234 ✅
+    SPECTRE_v35                            KL=0.6966 ✅
+    SPECTRE_v36                            KL=0.9366 ✅
+    SPECTRE_v37                            KL=0.6883 ✅
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  SPECTRE_v26                            killed        6.4     0.0557   0.8138
+  SPECTRE_v28                            killed        7.6     0.0093   0.6025
+  SPECTRE_v29                            killed        0.2          -        -
+  SPECTRE_v30                            crashed      14.1     0.0095   0.7301
+  SPECTRE_v31                            killed       10.5     0.0159   0.6699
+  SPECTRE_v32                            killed        6.1     0.0074   0.7612
+  SPECTRE_v33                            killed        0.7          -        -
+  SPECTRE_v34                            killed        0.8     0.0089   0.6234
+  SPECTRE_v35                            killed       28.6     0.0072   0.6966
+  SPECTRE_v36                            killed       25.2     0.0695   0.9366
+  SPECTRE_v37                            killed        6.7     0.0038   0.6883
+
+================================================================================
+  Phase 7: New Policy Series (Final Fixes) (5 runs)
+================================================================================
+  Period: 2026-04-22 to 2026-04-30
+  Total compute: 128.5 hrs | Avg: 25.7 hrs | Max: 92.4 hrs
+  Outcomes: {'killed': 4, 'running': 1}
+  Entropy coefs (final):
+    SPECTRE_new_policy                     α=0.0036 ⚠️ CRASH
+    SPECTRE_new_policy_1                   α=0.0020 ⚠️ CRASH
+    SPECTRE_new_policy_2                   α=0.0081 ⚡ LOW
+    SPECTRE_new_policy_test_3              α=0.0080 ⚡ LOW
+    SPECTRE_new_policy_test_4              α=0.0600 ✅
+  World model KL (final):
+    SPECTRE_new_policy                     KL=0.9584 ✅
+    SPECTRE_new_policy_1                   KL=0.8793 ✅
+    SPECTRE_new_policy_2                   KL=0.7800 ✅
+    SPECTRE_new_policy_test_3              KL=0.5890 ✅
+    SPECTRE_new_policy_test_4              KL=0.0565 💀 COLLAPSED
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  SPECTRE_new_policy                     killed       24.4     0.0036   0.9584
+  SPECTRE_new_policy_1                   killed       92.4     0.0020   0.8793
+  SPECTRE_new_policy_2                   killed        1.1     0.0081   0.7800
+  SPECTRE_new_policy_test_3              killed        9.7     0.0080   0.5890
+  SPECTRE_new_policy_test_4              running       0.9     0.0600   0.0565
+
+================================================================================
+  Other Projects (25 runs)
+================================================================================
+  Period: 2026-01-27 to 2026-02-12
+  Total compute: 158.6 hrs | Avg: 6.3 hrs | Max: 48.6 hrs
+  Outcomes: {'crashed': 5, 'killed': 12, 'failed': 3, 'finished': 5}
+  Entropy coefs (final):
+    Test-Meta-v2.5                         α=0.0269 ⚡ LOW
+    Rapid-Meta-Adapt-v1                    α=0.0005 ⚠️ CRASH
+    Rapid-Meta-Adapt-v1.2                  α=0.0080 ⚡ LOW
+    Rapid-Meta-Adapt-v2.0-Fixed            α=0.0197 ⚡ LOW
+    Rapid-Meta-Hybrid-v2.5                 α=0.0001 ⚠️ CRASH
+    Rapid-Meta-Hybrid-v3                   α=0.0001 ⚠️ CRASH
+    Rapid-Meta-LIDAR-v3                    α=0.0078 ⚡ LOW
+    Rapid-Meta-RL-SAC-Original             α=0.0619 ✅
+
+  Name                                   State         Hrs    EntCoef    WM_KL
+  ---------------------------------------------------------------------------
+  RESeL-TM                               crashed      48.6          -        -
+  Test-Meta-v2.5                         killed        0.0          -        -
+  Test-Meta-v2.5                         killed       29.8     0.0269        -
+  sac_lidar_vanilla                      failed        6.3          -        -
+  sac_lidar_v2                           killed        0.7          -        -
+  sac_lidar_fresh                        killed        0.5          -        -
+  sac_lidar_final                        killed        5.5          -        -
+  Rapid-Meta-Adapt-v1                    killed        2.0     0.0005        -
+  Rapid-Meta-Adapt-v1.2                  crashed      16.8     0.0080        -
+  Rapid-Meta-Adapt-v2.0-Fixed            killed       11.7     0.0197        -
+  Rapid-Meta-Hybrid-v3.0                 killed        0.4          -        -
+  Rapid-Meta-Hybrid-v7.0                 killed        0.0          -        -
+  Rapid-Meta-Hybrid-v2.5                 crashed       4.2     0.0001        -
+  Rapid-Meta-Hybrid-v3                   killed        5.0     0.0001        -
+  Rapid-Meta-Hybrid-v3.1                 failed        0.1          -        -
+  Rapid-Meta-LIDAR-v1                    failed       11.0          -        -
+  Rapid-Meta-LIDAR-v3                    killed        1.3     0.0078        -
+  Rapid-Meta-RL-SAC-Original             killed        0.9     0.0619        -
+  Rapid-Meta-RL-CNN_LIDAR                crashed      11.3          -        -
+  dazzling-totem-1                       finished      0.0          -        -
+  hpsweep_trial_2                        finished      0.2          -        -
+  lucky-glade-3                          finished      0.0          -        -
+  hpsweep_trial_3                        crashed       0.1          -        -
+  dutiful-planet-5                       finished      0.0          -        -
+  hpsweep_trial_4                        finished      2.0          -        -
+
+
+====================================================================================================
+PROBLEM PATTERN SUMMARY
+====================================================================================================
+
+--- ENTROPY COEFFICIENT TRAJECTORY ---
+  SPECTRE                                  0.0219 ✅ ████
+  SPECTRE_v1                               0.0033 💀 
+  SPECTRE_v2                               0.0031 💀 
+  SPECTRE_v3                               0.0100 ⚡ ██
+  SPECTRE_v4                               0.0142 ⚡ ██
+  SPECTRE_v5                               0.0116 ⚡ ██
+  SPECTRE_v6                               0.0500 ✅ ██████████
+  SPECTRE_v7                               0.0500 ✅ ██████████
+  SPECTRE_v8                               0.1001 ✅ ████████████████████
+  SPECTRE_v9                               0.0571 ✅ ███████████
+  SPECTRE_v10                              0.3272 ✅ ██████████████████████████████████████████████████
+  SPECTRE_v10.5                            0.2333 ✅ ██████████████████████████████████████████████
+  SPECTRE_v11                              0.5745 ✅ ██████████████████████████████████████████████████
+  SPECTRE_v12                              0.2333 ✅ ██████████████████████████████████████████████
+  SPECTRE_v13                              0.2333 ✅ ██████████████████████████████████████████████
+  SPECTRE_v14                              0.1493 ✅ █████████████████████████████
+  SPECTRE_v15                              0.1735 ✅ ██████████████████████████████████
+  SPECTRE_v16                              0.0747 ✅ ██████████████
+  SPECTRE_v17                                -    ⬜
+  SPECTRE_v18                                -    ⬜
+  SPECTRE_v19                              0.0435 ✅ ████████
+  SPECTRE_v20                              0.0705 ✅ ██████████████
+  SPECTRE_v21                              0.0952 ✅ ███████████████████
+  SPECTRE_v22                              0.1735 ✅ ██████████████████████████████████
+  SPECTRE_v23                              0.1495 ✅ █████████████████████████████
+  SPECTRE_v24                              0.1493 ✅ █████████████████████████████
+  SPECTRE_v25                                -    ⬜
+  SPECTRE_v26                              0.0557 ✅ ███████████
+  SPECTRE_v28                              0.0093 ⚡ █
+  SPECTRE_v29                                -    ⬜
+  SPECTRE_v30                              0.0095 ⚡ █
+  SPECTRE_v31                              0.0159 ⚡ ███
+  SPECTRE_v32                              0.0074 ⚡ █
+  SPECTRE_v33                                -    ⬜
+  SPECTRE_v34                              0.0089 ⚡ █
+  SPECTRE_v35                              0.0072 ⚡ █
+  SPECTRE_v36                              0.0695 ✅ █████████████
+  SPECTRE_v37                              0.0038 💀 
+  SPECTRE_new_policy                       0.0036 💀 
+  SPECTRE_new_policy_1                     0.0020 💀 
+  SPECTRE_new_policy_2                     0.0081 ⚡ █
+  SPECTRE_new_policy_test_3                0.0080 ⚡ █
+  SPECTRE_new_policy_test_4                0.0600 ✅ ███████████
+
+--- WORLD MODEL KL TRAJECTORY ---
+  SPECTRE                                    -    ⬜
+  SPECTRE_v1                                 -    ⬜
+  SPECTRE_v2                                 -    ⬜
+  SPECTRE_v3                                 -    ⬜
+  SPECTRE_v4                                 -    ⬜
+  SPECTRE_v5                                 -    ⬜
+  SPECTRE_v6                                 -    ⬜
+  SPECTRE_v7                               0.6321 ✅ ███████████████████████████████
+  SPECTRE_v8                               0.5304 ✅ ██████████████████████████
+  SPECTRE_v9                               0.8857 ✅ ████████████████████████████████████████████
+  SPECTRE_v10                              0.9185 ✅ █████████████████████████████████████████████
+  SPECTRE_v10.5                            0.6481 ✅ ████████████████████████████████
+  SPECTRE_v11                              0.6439 ✅ ████████████████████████████████
+  SPECTRE_v12                              0.6590 ✅ ████████████████████████████████
+  SPECTRE_v13                              0.7642 ✅ ██████████████████████████████████████
+  SPECTRE_v14                              0.9060 ✅ █████████████████████████████████████████████
+  SPECTRE_v15                              0.8551 ✅ ██████████████████████████████████████████
+  SPECTRE_v16                              0.7066 ✅ ███████████████████████████████████
+  SPECTRE_v17                                -    ⬜
+  SPECTRE_v18                                -    ⬜
+  SPECTRE_v19                              0.6816 ✅ ██████████████████████████████████
+  SPECTRE_v20                              0.7530 ✅ █████████████████████████████████████
+  SPECTRE_v21                              0.7122 ✅ ███████████████████████████████████
+  SPECTRE_v22                              0.6919 ✅ ██████████████████████████████████
+  SPECTRE_v23                              0.7779 ✅ ██████████████████████████████████████
+  SPECTRE_v24                              0.8138 ✅ ████████████████████████████████████████
+  SPECTRE_v25                                -    ⬜
+  SPECTRE_v26                              0.8138 ✅ ████████████████████████████████████████
+  SPECTRE_v28                              0.6025 ✅ ██████████████████████████████
+  SPECTRE_v29                                -    ⬜
+  SPECTRE_v30                              0.7301 ✅ ████████████████████████████████████
+  SPECTRE_v31                              0.6699 ✅ █████████████████████████████████
+  SPECTRE_v32                              0.7612 ✅ ██████████████████████████████████████
+  SPECTRE_v33                                -    ⬜
+  SPECTRE_v34                              0.6234 ✅ ███████████████████████████████
+  SPECTRE_v35                              0.6966 ✅ ██████████████████████████████████
+  SPECTRE_v36                              0.9366 ✅ ██████████████████████████████████████████████
+  SPECTRE_v37                              0.6883 ✅ ██████████████████████████████████
+  SPECTRE_new_policy                       0.9584 ✅ ███████████████████████████████████████████████
+  SPECTRE_new_policy_1                     0.8793 ✅ ███████████████████████████████████████████
+  SPECTRE_new_policy_2                     0.7800 ✅ ███████████████████████████████████████
+  SPECTRE_new_policy_test_3                0.5890 ✅ █████████████████████████████
+  SPECTRE_new_policy_test_4                0.0565 💀 ██

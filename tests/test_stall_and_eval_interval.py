@@ -2,7 +2,13 @@ import unittest
 from pathlib import Path
 
 import tmrl.config.config_constants as cfg
-from tmrl.training_offline import compute_stall_state, compute_stall_dashboard
+from tmrl.training_offline import (
+    _update_hgi_eval_gap_metrics,
+    compute_best_checkpoint_decision,
+    compute_hgi_det_stoch_gap_health,
+    compute_stall_dashboard,
+    compute_stall_state,
+)
 
 
 class TestStallMetrics(unittest.TestCase):
@@ -39,6 +45,30 @@ class TestStallMetrics(unittest.TestCase):
         self.assertEqual(warning["status"], "warning")
         self.assertEqual(stalled["status"], "stalled")
 
+    def test_hgi_gap_health_flags_dead_deterministic_policy(self):
+        health = compute_hgi_det_stoch_gap_health(return_det=0.05, return_stoch=16.0, gap_warn=10.0)
+        self.assertLess(health, 0.01)
+
+    def test_hgi_gap_health_reduces_critic_health_and_imag_trust(self):
+        metrics = {
+            "return_test_det": 0.05,
+            "return_test_stoch": 16.0,
+            "hgi/model_trust": 0.9,
+            "hgi/critic_health": 0.9,
+            "hgi/imag_trust": 0.81,
+        }
+
+        _update_hgi_eval_gap_metrics(metrics)
+
+        self.assertEqual(metrics["hgi/critic_health_pre_eval"], 0.9)
+        self.assertLess(metrics["hgi/det_stoch_gap_health"], 0.01)
+        self.assertEqual(metrics["hgi/critic_health"], metrics["hgi/det_stoch_gap_health"])
+        self.assertLess(metrics["hgi/imag_trust"], 0.01)
+
+    def test_hgi_gap_health_accepts_tracking_deterministic_policy(self):
+        health = compute_hgi_det_stoch_gap_health(return_det=9.5, return_stoch=9.7, gap_warn=10.0)
+        self.assertGreater(health, 0.9)
+
 
 class TestEvalIntervalWiring(unittest.TestCase):
     def test_test_episode_interval_constant_exists(self):
@@ -46,5 +76,52 @@ class TestEvalIntervalWiring(unittest.TestCase):
         self.assertGreaterEqual(int(cfg.TEST_EPISODE_INTERVAL), 0)
 
     def test_worker_run_uses_configured_test_episode_interval(self):
-        source = Path("tmrl/tmrl/__main__.py").read_text(encoding="utf-8")
+        source = Path("tmrl/__main__.py").read_text(encoding="utf-8")
         self.assertIn("rw.run(test_episode_interval=cfg.TEST_EPISODE_INTERVAL)", source)
+
+
+class TestBestCheckpointDecision(unittest.TestCase):
+    def test_below_threshold_does_not_save(self):
+        decision = compute_best_checkpoint_decision(
+            metrics={"return_test_det": 49.9, "episode_length_test_det": 1000},
+            best_state={"best_metric_value": float("-inf"), "best_tie_breaker_value": float("-inf")},
+            alg_cfg={"BEST_CHECKPOINT_MIN_RETURN": 50.0},
+        )
+
+        self.assertFalse(decision["triggered"])
+
+    def test_first_high_deterministic_return_saves(self):
+        decision = compute_best_checkpoint_decision(
+            metrics={"return_test_det": 82.6, "episode_length_test_det": 960},
+            best_state={"best_metric_value": float("-inf"), "best_tie_breaker_value": float("-inf")},
+            alg_cfg={"BEST_CHECKPOINT_MIN_RETURN": 50.0},
+        )
+
+        self.assertTrue(decision["triggered"])
+
+    def test_lower_later_return_does_not_save(self):
+        decision = compute_best_checkpoint_decision(
+            metrics={"return_test_det": 71.0, "episode_length_test_det": 1000},
+            best_state={"best_metric_value": 82.6, "best_tie_breaker_value": 960},
+            alg_cfg={"BEST_CHECKPOINT_MIN_RETURN": 50.0},
+        )
+
+        self.assertFalse(decision["triggered"])
+
+    def test_equal_return_with_longer_deterministic_episode_saves(self):
+        decision = compute_best_checkpoint_decision(
+            metrics={"return_test_det": 82.6, "episode_length_test_det": 1000},
+            best_state={"best_metric_value": 82.6, "best_tie_breaker_value": 960},
+            alg_cfg={"BEST_CHECKPOINT_MIN_RETURN": 50.0},
+        )
+
+        self.assertTrue(decision["triggered"])
+
+    def test_disabled_config_never_saves(self):
+        decision = compute_best_checkpoint_decision(
+            metrics={"return_test_det": 100.0, "episode_length_test_det": 1000},
+            best_state={"best_metric_value": float("-inf"), "best_tie_breaker_value": float("-inf")},
+            alg_cfg={"BEST_CHECKPOINT_ENABLED": False, "BEST_CHECKPOINT_MIN_RETURN": 50.0},
+        )
+
+        self.assertFalse(decision["triggered"])
