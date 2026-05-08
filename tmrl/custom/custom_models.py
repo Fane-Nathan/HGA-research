@@ -466,7 +466,7 @@ class SquashedGaussianEffNetActor(TorchActorModule):
 
         self.cnn = effnetv2_s(nb_channels_in=4, dim_output=247, width_mult=1.).float()
         self.net = mlp([256, 256], [nn.ReLU, nn.ReLU])
-        self.mu_layer = nn.Linear(256, dim_act)
+        self.mu_layer = nn.Linear(1024, dim_act)
         self.log_std_layer = nn.Linear(256, dim_act)
         self.act_limit = act_limit
 
@@ -613,7 +613,7 @@ class SquashedGaussianVanillaCNNActor(TorchActorModule):
         dim_act = action_space.shape[0]
         act_limit = action_space.high[0]
         self.net = VanillaCNN(q_net=False)
-        self.mu_layer = nn.Linear(256, dim_act)
+        self.mu_layer = nn.Linear(1024, dim_act)
         self.log_std_layer = nn.Linear(256, dim_act)
         self.act_limit = act_limit
 
@@ -759,7 +759,7 @@ class HybridNanoEffNetActor(TorchActorModule):
         self.fusion_norm = nn.LayerNorm(128 + 64)
         self.net = mlp([128 + 64, 256, 256], SiLU, SiLU)  # SiLU (Swish) is better for RL
 
-        self.mu_layer = nn.Linear(256, dim_act)
+        self.mu_layer = nn.Linear(1024, dim_act)
         self.log_std_layer = nn.Linear(256, dim_act)
         self.act_limit = act_limit
 
@@ -880,7 +880,7 @@ class SharedBackboneActorHead(nn.Module):
         act_limit = action_space.high[0]
         
         self.net = mlp([feature_dim, 256, 256], SiLU, SiLU)
-        self.mu_layer = nn.Linear(256, dim_act)
+        self.mu_layer = nn.Linear(1024, dim_act)
         self.log_std_layer = nn.Linear(256, dim_act)
         self.act_limit = act_limit
 
@@ -973,7 +973,7 @@ class SharedBackboneHybridActor(TorchActorModule):
 
         # Policy head
         self.net = mlp([128 + 64, 256, 256], SiLU, SiLU)
-        self.mu_layer = nn.Linear(256, dim_act)
+        self.mu_layer = nn.Linear(1024, dim_act)
         self.log_std_layer = nn.Linear(256, dim_act)
         self.std_net = nn.Sequential(
             nn.Linear(128 + 64, 64),
@@ -1107,15 +1107,15 @@ class DroQQHead(nn.Module):
         dim_act = action_space.shape[0]
         
         self.q = nn.Sequential(
-            nn.Linear(feature_dim + dim_act, 384),
-            nn.LayerNorm(384),
+            nn.Linear(feature_dim + dim_act, 1536),
+            nn.LayerNorm(1536),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(384, 384),
-            nn.LayerNorm(384),
+            nn.Linear(1536, 1536),
+            nn.LayerNorm(1536),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(384, 1)
+            nn.Linear(1536, 1)
         )
 
     def forward(self, features, act, film=None):
@@ -1613,17 +1613,17 @@ class ContextualSharedBackboneHybridActor(TorchActorModule):
         self._gru_hidden = None  # persistent hidden state for online inference
 
         # PEARL Policy MLP: Actor receives z for fast context-based adaptation
-        self.net = mlp([FUSED_DIM + CONTEXT_Z_DIM, 256, 256], nn.ReLU, nn.ReLU)
-        self.mu_layer = nn.Linear(256, dim_act)
+        self.net = mlp([FUSED_DIM + CONTEXT_Z_DIM, 1024, 1024], nn.ReLU, nn.ReLU)
+        self.mu_layer = nn.Linear(1024, dim_act)
         # Smart init: car drives forward from step 1 (steer=0, gas=0.3, brake=0)
         with torch.no_grad():
             nn.init.zeros_(self.mu_layer.weight)
             self.mu_layer.bias.copy_(torch.tensor([0.0, 2.0, -2.0]))
         
         self.std_net = nn.Sequential(
-            nn.Linear(FUSED_DIM + CONTEXT_Z_DIM, 64),
+            nn.Linear(FUSED_DIM + CONTEXT_Z_DIM, 256),
             nn.SiLU(),
-            nn.Linear(64, dim_act)
+            nn.Linear(256, dim_act)
         )
         # Initialize bias to 1.0 -> tanh(0.97) -> log_std ~ -0.7 -> std ~ 0.5
         nn.init.constant_(self.std_net[-1].bias, 1.0)

@@ -276,6 +276,18 @@ def iterate_epochs(run_cls,
                 run_instance = updater_fn(run_instance, run_cls)
                 logging.info(f"Checkpoint updated in {time.time() - t1} seconds.")
 
+        # --- Device verification ---
+        import torch
+        _ta = getattr(run_instance, 'agent', None)
+        if _ta is not None and hasattr(_ta, 'model'):
+            _dev = next(_ta.model.parameters()).device
+            logging.info(f"DEVICE CHECK: agent.model is on: {_dev}")
+            logging.info(f"DEVICE CHECK: CUDA_TRAINING={cfg.CUDA_TRAINING}, torch.cuda.is_available()={torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                logging.info(f"DEVICE CHECK: GPU = {torch.cuda.get_device_name(0)}")
+        else:
+            logging.info(f"DEVICE CHECK: no agent.model found on run_instance")
+
         while run_instance.epoch < run_instance.epochs:
             # time.sleep(1)  # on network file systems writing files is asynchronous and we need to wait for sync
             yield run_instance.run_epoch(interface=interface)  # yield stats data frame (this makes this function a generator)

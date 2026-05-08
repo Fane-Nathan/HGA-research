@@ -1989,6 +1989,9 @@ class DroQSACAgent(TrainingAgent):
         self.model_target = no_grad(deepcopy(self.model))
 
         # Optimizer for actor's policy head only (features are fixed/detached for actor)
+        logging.info(f"DroQSAC device config: device='{device}', CUDA_TRAINING={cfg.CUDA_TRAINING}")
+        logging.info(f"DroQSAC model actual device: {next(self.model.parameters()).device}")
+        logging.info(f"DroQSAC CUDA available: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'}")
         self.pi_optimizer = Adam([
             {'params': list(self.model.actor.net.parameters()) +
                        list(self.model.actor.mu_layer.parameters()),
@@ -2700,13 +2703,23 @@ class DroQSACAgent(TrainingAgent):
             self.curiosity_rms = RunningMeanStd()
             logging.info("ImaginationActor lazy-initialized for existing checkpoint")
 
-        # Always refresh curiosity config from live config (so config.json changes
-        # take effect on trainer restart without needing RESET_TRAINING=true)
+        # Refresh world-model/HGI knobs from live config on resume.
         if self.wm_enabled:
             wm_cfg_live = cfg.TMRL_CONFIG.get("WORLD_MODEL", {})
+            self.wm_warmup = int(wm_cfg_live.get("WARMUP_STEPS", getattr(self, "wm_warmup", 3000)))
+            self.wm_horizon = int(wm_cfg_live.get("ROLLOUT_HORIZON", getattr(self, "wm_horizon", 15)))
+            self.wm_batch_size = int(wm_cfg_live.get("IMAGINED_BATCH_SIZE", getattr(self, "wm_batch_size", 256)))
             self.curiosity_scale = wm_cfg_live.get("CURIOSITY_SCALE", 0.1)
             self.curiosity_reward_clip = wm_cfg_live.get("CURIOSITY_REWARD_CLIP", 5.0)
+            self.imag_noise_scale = wm_cfg_live.get(
+                "IMAGINATION_NOISE_SCALE",
+                getattr(self, "imag_noise_scale", 0.3),
+            )
             if hasattr(self, "dynamics"):
+                wm_lr = float(wm_cfg_live.get("MODEL_LR", 3e-4))
+                if hasattr(self, "dynamics_optimizer"):
+                    for group in self.dynamics_optimizer.param_groups:
+                        group["lr"] = wm_lr
                 prior_param_ids = {
                     id(param)
                     for group in self.dynamics_optimizer.param_groups
@@ -2771,12 +2784,12 @@ class DroQSACAgent(TrainingAgent):
 
         # Force update learning rates and target entropy from live config on every trainer restart.
         # Uses a versioned flag so bumping the version forces re-application on existing checkpoints.
-        _OVERRIDE_VERSION = 5  # Bump this to force re-apply on next restart
+        _OVERRIDE_VERSION = 6  # Bump this to force re-apply on next restart
         if getattr(self, "_override_version", 0) < _OVERRIDE_VERSION:
             import logging
             alg_cfg = cfg.TMRL_CONFIG.get("ALG", {})
-            new_lr_actor = 1e-4
-            new_lr_critic = 1e-4
+            new_lr_actor = float(alg_cfg.get("LR_ACTOR", 1e-4))
+            new_lr_critic = float(alg_cfg.get("LR_CRITIC", 1e-4))
             for param_group in self.pi_optimizer.param_groups:
                 param_group['lr'] = new_lr_actor
             for param_group in self.q_optimizer.param_groups:
