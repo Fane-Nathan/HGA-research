@@ -253,6 +253,7 @@ class HealthGatedFloorController:
         self._last_direction = []
         self._pending_direction = []
         self._pending_count = []
+        self._eval_stats = {}
         self.update_base(base_floor, alg_cfg or {})
 
     @staticmethod
@@ -273,6 +274,23 @@ class HealthGatedFloorController:
     @staticmethod
     def _clip01(value):
         return max(0.0, min(1.0, float(value)))
+
+    def _z_score_update(self, key, value, beta=0.95, eps=1e-8):
+        mean_key = f"{key}_mean"
+        var_key = f"{key}_var"
+        mean = self._eval_stats.get(mean_key, value)
+        var = self._eval_stats.get(var_key, 0.0)
+        
+        diff = value - mean
+        new_mean = mean + (1.0 - beta) * diff
+        new_var = beta * (var + (1.0 - beta) * diff * diff)
+        
+        self._eval_stats[mean_key] = new_mean
+        self._eval_stats[var_key] = new_var
+        std = new_var ** 0.5
+        
+        z = (value - mean) / (std + eps) if std > eps else 0.0
+        return z, new_mean, std
 
     def update_base(self, base_floor, alg_cfg=None):
         alg_cfg = alg_cfg or {}
@@ -427,12 +445,35 @@ class HealthGatedFloorController:
         g_consolidate = 1.0 / (1.0 + (k - 1.0) * high_churn * critic_ok)
 
         preserve_present = self._update_eval_state(metrics)
+        compress_badness = 0.0
+        preserve_badness = 0.0
         if preserve_present:
+            det = self._metric(metrics, "return_test_det", 0.0)
+            stoch = self._metric(metrics, "return_test_stoch", det)
+            
+            ret_scale_val = abs(det) + abs(stoch)
+            _, ema_ret_scale, _ = self._z_score_update("ret_scale", ret_scale_val)
+            
+            gap_norm = (det - stoch) / (ema_ret_scale + 1e-8)
+            gap_z, _, _ = self._z_score_update("gap_norm", gap_norm)
+            det_z, _, _ = self._z_score_update("det", det)
+            stoch_z, _, _ = self._z_score_update("stoch", stoch)
+            
+            det_good_stoch_bad = (gap_z > 1.0 and det_z > 0.0 and stoch_z < 0.0)
+            if det_good_stoch_bad:
+                compress_badness = float(torch.sigmoid(torch.tensor(gap_z - 1.0)).item())
+                
+            stoch_good_det_bad = (gap_z < -1.0 and stoch_z > 0.0 and det_z < 0.0)
+            if stoch_good_det_bad:
+                preserve_badness = float(torch.sigmoid(torch.tensor(-gap_z - 1.0)).item())
+
             det_gap_ema = self._det_gap_ema or 0.0
             if preserve_hard_gate and det_gap_ema <= det_tau:
                 preserve_drive = torch.tensor(0.0, device=self.device)
             else:
                 preserve_drive = self._sigmoid((det_gap_ema - det_tau) / det_sigma).to(self.device)
+            
+            preserve_drive = preserve_drive * (1.0 - compress_badness)
             g_preserve = 1.0 / (1.0 + (k - 1.0) * preserve_drive)
         else:
             preserve_drive = torch.tensor(0.0, device=self.device)
@@ -454,6 +495,11 @@ class HealthGatedFloorController:
         g_recovery = 1.0 + (k - 1.0) * recovery_drive
 
         target = self.base_floor * g_search * g_consolidate * g_preserve * g_recovery
+        max_alpha_compress = float(alg_cfg.get("HEALTH_ENTROPY_MAX_COMPRESS", 2.0))
+        import math
+        alpha_scale = math.exp(-max_alpha_compress * compress_badness)
+        target = target * alpha_scale
+        
         target = torch.maximum(torch.minimum(target, self.base_floor), self.alpha_min_floor)
 
         stale_active = (
@@ -494,6 +540,11 @@ class HealthGatedFloorController:
             "entropy_health/q_churn": float(q_churn),
             "entropy_health/critic_health": float(critic_health),
             "entropy_health/model_trust": float(model_trust),
+        "entropy_health/compress_badness": float(compress_badness),
+            "entropy_health/preserve_badness": float(preserve_badness),
+            "entropy_health/gap_z": float(gap_z) if preserve_present else 0.0,
+            "entropy_health/det_z": float(det_z) if preserve_present else 0.0,
+            "entropy_health/stoch_z": float(stoch_z) if preserve_present else 0.0,
         }
         for idx, name in enumerate(_HEALTH_ENTROPY_DIMS[: self.base_floor.numel()]):
             diag[f"entropy_health/g_recovery_{name}"] = g_recovery[idx].item()
@@ -544,6 +595,12 @@ class HealthGatedFloorController:
             proposed = max(self.alpha_min_floor[idx].item(), min(self.base_floor[idx].item(), proposed))
             next_floor[idx] = proposed
 
+        cb = diag.get("entropy_health/compress_badness", 0.0)
+        if cb > 0.0:
+            for idx in range(self.current_floor.numel()):
+                shrunk = min(self.current_floor[idx].item(), next_floor[idx].item()) * (1.0 - 0.2 * cb)
+                next_floor[idx] = max(self.alpha_min_floor[idx].item(), shrunk)
+
         self.current_floor = next_floor
         for idx, name in enumerate(_HEALTH_ENTROPY_DIMS[: self.current_floor.numel()]):
             diag[f"entropy_health/floor_actual_{name}"] = self.current_floor[idx].item()
@@ -584,6 +641,26 @@ def _linear_risk(value, soft, hard):
         return float(value > soft)
     return _clip01((value - soft) / (hard - soft))
 
+
+def _z_score_update(stats, key, value, beta=0.95, eps=1e-8):
+    if stats is None:
+        stats = {}
+    mean_key = f"{key}_mean"
+    var_key = f"{key}_var"
+    mean = float(stats.get(mean_key, value))
+    var = float(stats.get(var_key, 0.0))
+    value = float(value)
+    
+    diff = value - mean
+    new_mean = mean + (1.0 - beta) * diff
+    new_var = beta * (var + (1.0 - beta) * diff * diff)
+    
+    stats[mean_key] = new_mean
+    stats[var_key] = new_var
+    std = new_var ** 0.5
+    
+    z = (value - mean) / (std + eps) if std > eps else 0.0
+    return float(z), float(new_mean), float(std), stats
 
 def _ema_ratio_update(stats, key, value, decay=0.95, warmup=2, eps=1e-8):
     """Return value / previous EMA, then update the EMA in-place."""
@@ -2561,7 +2638,7 @@ class DroQSACAgent(TrainingAgent):
                         o, a, r, o2, d, _ = batch
                         ctx = None
 
-                    uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None
+                    uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None and 'context' in getattr(getattr(self.model.forward_features, '__func__', self.model.forward_features), '__code__', type(lambda:0).__code__).co_varnames
                     if uses_context and ctx is not None:
                         fused, critic, film, _ = self.model.forward_features(o, ctx, img_context=img_ctx)
                     else:
@@ -2833,7 +2910,7 @@ class DroQSACAgent(TrainingAgent):
         alpha_t, alpha_floor_t = self._apply_alpha_floor()
 
         # Check if model supports FiLM context (None = Vanilla baseline)
-        uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None
+        uses_context = hasattr(self.model, 'context_encoder') and self.model.context_encoder is not None and 'context' in getattr(getattr(self.model.forward_features, '__func__', self.model.forward_features), '__code__', type(lambda:0).__code__).co_varnames
 
         # === Target Q computation (with no_grad, dropout active) ===
         with torch.no_grad():
@@ -3160,6 +3237,53 @@ class DroQSACAgent(TrainingAgent):
                 loss_pi = loss_pi + loss_churn_weighted
                 with torch.no_grad():
                     churn_anchor_mu_abs_diff = (mu_pre_stochastic.detach() - anchor_mu).abs().mean().item()
+
+            # Dynamic Mu Churn Penalty based on compress_badness
+            compress_badness = 0.0
+            if hasattr(self, 'alpha_floor_controller') and self.alpha_floor_controller is not None:
+                compress_badness = self.alpha_floor_controller.last_diag.get("entropy_health/compress_badness", 0.0)
+            elif hasattr(self, 'health_entropy') and self.health_entropy is not None:
+                compress_badness = self.health_entropy.last_diag.get("entropy_health/compress_badness", 0.0)
+
+            actor_bridge_metrics["entropy_health/compress_badness"] = compress_badness
+
+            if compress_badness > 0.0:
+                base_mu_preserve = float(alg_cfg.get("ACTOR_CHURN_REG_LAMBDA_COMPRESS", 0.05))
+                lambda_mu_preserve = base_mu_preserve * compress_badness
+                
+                if not churn_enabled or 'anchor_mu' not in locals():
+                    anchor_mu = self._actor_churn_anchor_mu(fused_o_actor, z_actor)
+                    
+                loss_mu_preserve = lambda_mu_preserve * (mu_pre_stochastic - anchor_mu.detach()).abs().mean()
+                loss_pi = loss_pi + loss_mu_preserve
+
+            # Dynamic Log-Std Compression Penalty
+            if compress_badness > 0.0:
+                with torch.no_grad():
+                    sample_std_val = pi_clamped.std(dim=0, unbiased=False).mean().item()
+                    real_std_val = a.std(dim=0, unbiased=False).mean().item()
+                    spread_ratio = sample_std_val / (real_std_val + 1e-8)
+                
+                if not hasattr(self, "_adaptive_safety_stats"):
+                    self._adaptive_safety_stats = {}
+                spread_z, _, _, self._adaptive_safety_stats = _z_score_update(self._adaptive_safety_stats, "spread_ratio", spread_ratio)
+                std_badness = float(torch.sigmoid(torch.tensor(spread_z)).item())
+                
+                base_std_compress = float(alg_cfg.get("ACTOR_STD_COMPRESS_LAMBDA", 0.02))
+                lambda_std_compress = base_std_compress * compress_badness * std_badness
+                
+                if lambda_std_compress > 0.0:
+                    if z_actor is not None:
+                        actor_input_std = torch.cat([fused_o_actor, z_actor], dim=-1)
+                    else:
+                        actor_input_std = fused_o_actor
+                    log_std_raw_skill = self.model.actor.std_net(actor_input_std)
+                    log_std_skill = core._compute_log_std_smooth(log_std_raw_skill)
+                    
+                    loss_std_compress = lambda_std_compress * log_std_skill.mean()
+                    loss_pi = loss_pi + loss_std_compress
+                actor_bridge_metrics["entropy_health/spread_z"] = spread_z
+                actor_bridge_metrics["entropy_health/std_badness"] = std_badness
 
             # EWC: lighter penalty on actor (0.1x) to allow policy adaptation
             if self._ewc_active and self.ewc_lambda > 0:
